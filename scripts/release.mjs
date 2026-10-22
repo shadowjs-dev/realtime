@@ -209,11 +209,20 @@ const defaultSleep = (ms) => new Promise((done) => setTimeout(done, ms));
  * Publishes the packages the registry does not have, then checks that each one is there.
  * @param {string} root The repository folder.
  * @param {string} registry The registry URL.
- * @param {{ dryRun: boolean, sleep?: (ms: number) => Promise<void> }} options `dryRun` prints and publishes nothing.
+ * @param {object} options
+ * @param {boolean} options.dryRun Prints and publishes nothing.
+ * @param {(ms: number) => Promise<void>} [options.sleep] Waits between polls (replaced in tests).
+ * @param {(name: string, version: string) => Promise<boolean>} [options.listed] Whether the registry lists a version (replaced in tests).
+ * @param {number} [options.listingMinutes] How long to wait for a published version to be listed.
  * @returns {Promise<string[]>} `name@version` of what was published (or would be).
  * @throws {Error} When a publish fails or the version does not appear on the registry afterward.
  */
-export async function publishMissing(root, registry, { dryRun, sleep = defaultSleep }) {
+export async function publishMissing(
+  root,
+  registry,
+  { dryRun, sleep = defaultSleep, listed = undefined, listingMinutes = 20 },
+) {
+  const isListed = listed ?? ((name, version) => isPublished(registry, name, version));
   const missing = await missingPackages(root, registry);
   const problems = problemsOf(missing, process.env.GITHUB_REPOSITORY);
   if (problems.length > 0) throw new Error(problems.join("\n"));
@@ -231,19 +240,30 @@ export async function publishMissing(root, registry, { dryRun, sleep = defaultSl
     else args.push("--provenance");
     if (dryRun) args.push("--dry-run");
     console.log(`${dryRun ? "would publish" : "publishing"} ${name}@${version}`);
-    const result = npm(args, { stdio: "inherit" });
-    if (result.status !== 0) throw new Error(`npm publish failed for ${name}@${version}`);
+    const result = npm(args, { stdio: ["inherit", "inherit", "pipe"] });
+    process.stderr.write(result.stderr ?? "");
+    // The first version of a package is staged and listed minutes later, so a run that publishes it, or a run that starts again after
+    // one that failed, can be told the version is there although the registry does not list it yet: that is a publish already done.
+    const already = /cannot publish over (?:the )?previously (?:published|staged)/i.test(
+      result.stderr ?? "",
+    );
+    if (result.status !== 0 && !already)
+      throw new Error(`npm publish failed for ${name}@${version}`);
+    if (already)
+      console.log(`${name}@${version} is already published; waiting for the registry to list it`);
     published.push(`${name}@${version}`);
     if (dryRun) continue;
-    // The registry can take a moment to list a new version; the next package may need this one to install.
+    // npm can take several minutes to list the first version of a package it has not seen before (it scans it first); the next package of
+    // this repository may need this one to install, and the tag and the release are made only when the version is listed.
+    const pollMs = 10_000;
     let visible = false;
-    for (let attempt = 0; attempt < 24 && !visible; attempt += 1) {
-      visible = await isPublished(registry, name, version);
-      if (!visible) await sleep(5_000);
+    for (let attempt = 0; attempt < (listingMinutes * 60_000) / pollMs && !visible; attempt += 1) {
+      visible = await isListed(name, version);
+      if (!visible) await sleep(pollMs);
     }
     if (!visible)
       throw new Error(
-        `${name}@${version} was published but is not listed by ${registry} after two minutes`,
+        `${name}@${version} was published but is not listed by ${registry} after ${listingMinutes} minutes`,
       );
   }
   console.log(
