@@ -3,9 +3,8 @@ updates:
   - package-ecosystem: npm
     directory: "/"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
+      interval: monthly
+    open-pull-requests-limit: 2
     # These two follow a decision, not the newest release: the type definitions match the oldest Node.js the packages support, and the
     # TypeScript major is the one the type-aware lint rules and the declaration builds have been tested with.
     ignore:
@@ -29,8 +28,7 @@ updates:
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: weekly
-      day: monday
+      interval: monthly
     groups:
       actions:
         patterns:
