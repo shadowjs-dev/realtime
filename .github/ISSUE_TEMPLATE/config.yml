@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea
+    url: https://github.com/shadowjs-dev/shadow/discussions
+    about: Ask how to do something, or propose a change, before opening an issue.
+  - name: Report a security problem
+    url: https://github.com/shadowjs-dev/realtime/security/advisories/new
+    about: Never in a public issue. See SECURITY.md.

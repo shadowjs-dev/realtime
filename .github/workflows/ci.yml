@@ -1,0 +1,56 @@
+# Checks every push and pull request on the Node versions the packages support. Nothing here publishes or needs a secret.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    # Includes the wait for the packages of the other repositories on the first push.
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22.12.0", "24", "26"]
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+
+      # npm 10.9 (bundled with Node 22.12) is too old for some of the install features the repository relies on.
+      - name: Use a current npm on the oldest Node
+        if: ${{ matrix.node == '22.12.0' }}
+        run: npm install --global npm@11
+
+      # A repository pushed together with the packages it builds against waits for them (their repositories publish them) instead of failing.
+      - name: Wait for the ShadowJS packages this one needs
+        run: node scripts/release.mjs wait --timeout-minutes 120
+
+      - name: Install redis-server
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+
+      # The packages run on Node 22.12; the tools that build and test them (tsdown, Vitest) need a newer one, so on that leg the engine check of
+      # the install is off and the packages are still built and tested there.
+      - name: Install
+        run: node scripts/release.mjs install ${{ matrix.node == '22.12.0' && '--engine-strict=false' || '' }}
+
+      - name: Check (lint, typecheck, build, tests)
+        run: npm run check

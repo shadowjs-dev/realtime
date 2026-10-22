@@ -1,0 +1,107 @@
+{
+  "name": "@shadow-js/realtime",
+  "version": "1.0.0",
+  "description": "Typed channels, presence and resumable delivery over WebSocket or server-sent events",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/dev/index.d.ts",
+      "development": "./dist/dev/index.js",
+      "default": "./dist/prod/index.js"
+    },
+    "./server": {
+      "types": "./dist/dev/server/index.d.ts",
+      "development": "./dist/dev/server/index.js",
+      "default": "./dist/prod/server/index.js"
+    },
+    "./client": {
+      "types": "./dist/dev/client/index.d.ts",
+      "development": "./dist/dev/client/index.js",
+      "default": "./dist/prod/client/index.js"
+    },
+    "./hooks": {
+      "types": "./dist/dev/hooks.d.ts",
+      "development": "./dist/dev/hooks.js",
+      "default": "./dist/prod/hooks.js"
+    },
+    "./redis": {
+      "types": "./dist/dev/redis.d.ts",
+      "development": "./dist/dev/redis.js",
+      "default": "./dist/prod/redis.js"
+    },
+    "./cloudflare": {
+      "types": "./dist/dev/cloudflare.d.ts",
+      "development": "./dist/dev/cloudflare.js",
+      "default": "./dist/prod/cloudflare.js"
+    },
+    "./testing": {
+      "types": "./dist/dev/testing.d.ts",
+      "development": "./dist/dev/testing.js",
+      "default": "./dist/prod/testing.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsdown --config-loader native",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "biome check .",
+    "test": "vitest run --project unit --project dom --project server",
+    "test:gc": "vitest run --project gc --passWithNoTests",
+    "test:perf": "vitest run --project perf --passWithNoTests",
+    "check": "npm run lint && npm run typecheck && npm run build && npm test && npm run test:perf && npm run test:gc"
+  },
+  "homepage": "https://realtime.shadowjs.net",
+  "keywords": [
+    "shadowjs",
+    "realtime"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shadowjs-dev/realtime.git"
+  },
+  "bugs": {
+    "url": "https://github.com/shadowjs-dev/realtime/issues"
+  },
+  "peerDependencies": {
+    "@shadow-js/core": "^1.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@resvg/resvg-wasm": "2.6.2",
+    "@shadow-js/core": "^1.0.0",
+    "@shadow-js/dusk": "^1.0.0",
+    "@shadow-js/i18n": "*",
+    "@shadow-js/router": "*",
+    "@shadow-js/testing": "^1.0.0",
+    "@testing-library/dom": "10.4.2",
+    "@types/node": "^24.0.0",
+    "fast-check": "^4.10.2",
+    "happy-dom": "^21.0.3",
+    "satori": "0.43.0",
+    "sharp": "0.35.5",
+    "subset-font": "2.9.0",
+    "tsdown": "0.23.0",
+    "typescript": "7.0.2",
+    "vite": "8.3.3",
+    "vitest": "5.0.3"
+  },
+  "peerDependenciesMeta": {
+    "@shadow-js/core": {
+      "optional": true
+    }
+  }
+}

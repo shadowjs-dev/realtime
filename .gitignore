@@ -1,0 +1,10 @@
+node_modules
+dist
+coverage
+*.tsbuildinfo
+.vitest
+test-results
+**/.generated
+.DS_Store
+/.env*
+!/.env.example

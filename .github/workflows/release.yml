@@ -1,0 +1,128 @@
+# Publishes @shadow-js/realtime to npm with provenance and creates the GitHub release. It runs on every push to main and
+# publishes only the versions npm does not have yet, so releasing is: change the version, push. A push that changes no version ends after
+# the first job. Needs the NPM_TOKEN secret (an organization secret works). Started by hand it can do a dry run.
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run every check and print what would be published, without publishing"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      pending: ${{ steps.plan.outputs.pending }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: Which versions are not on npm yet
+        id: plan
+        run: node scripts/release.mjs plan
+
+      # Fail here, before the long jobs, when the secret was not added.
+      - name: Check that the npm token is set
+        if: ${{ steps.plan.outputs.pending == 'true' && !inputs.dry_run }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::The NPM_TOKEN secret is empty. Add an npm automation token as the NPM_TOKEN secret of this repository (or of the organization), then run this workflow again."
+            exit 1
+          fi
+
+  publish:
+    name: publish
+    needs: plan
+    if: ${{ needs.plan.outputs.pending == 'true' }}
+    runs-on: ubuntu-latest
+    # Includes the wait for the packages of the other repositories, which are published by their own runs.
+    timeout-minutes: 240
+    permissions:
+      contents: write
+      id-token: write
+    # The token is set for every step: npm sends it with the reads of the install too, and a placeholder token is refused by the registry.
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+
+      # Fail first, before the long steps, when the secret was not added.
+      - name: Check that the npm token is set
+        if: ${{ !inputs.dry_run }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::The NPM_TOKEN secret is empty. Add an npm automation token as the NPM_TOKEN secret of this repository (or of the organization), then run this workflow again."
+            exit 1
+          fi
+
+      # The other ShadowJS packages this one builds against are published by the other repositories' own runs; pushed together, this run
+      # waits for them instead of failing.
+      - name: Wait for the ShadowJS packages this one needs
+        run: node scripts/release.mjs wait --timeout-minutes 150
+
+      - name: Install redis-server
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+
+      - name: Install
+        run: node scripts/release.mjs install
+
+      - name: Check (lint, typecheck, build, tests)
+        run: npm run check
+
+      - name: Publish (dry run)
+        if: ${{ inputs.dry_run }}
+        run: node scripts/release.mjs publish --dry-run
+
+      - name: Publish
+        if: ${{ !inputs.dry_run }}
+        run: node scripts/release.mjs publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Tag and create the release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "v$VERSION already has a release"
+            exit 0
+          fi
+          notes=$(mktemp)
+          awk -v v="$VERSION" '$0 ~ "^## " v "$" {on=1; next} /^## / {on=0} on' CHANGELOG.md > "$notes"
+          gh release create "v$VERSION" --target "$GITHUB_SHA" --title "$VERSION" --notes-file "$notes"
