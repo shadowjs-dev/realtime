@@ -6,6 +6,13 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    # These two follow a decision, not the newest release: the type definitions match the oldest Node.js the packages support, and the
+    # TypeScript major is the one the type-aware lint rules and the declaration builds have been tested with.
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
     groups:
       development-tools:
         dependency-type: development
