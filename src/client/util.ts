@@ -5,11 +5,12 @@ export function backoff(attempt: number, min: number, max: number, random: () =>
 
 /** A random identifier of 12 base-36 characters, used to build idempotency keys. @internal */
 export function clientId(): string {
-  const bytes = new Uint8Array(8);
+  // Six bytes of two base-36 characters each make the twelve.
+  const bytes = new Uint8Array(6);
   globalThis.crypto.getRandomValues(bytes);
   let id = "";
   for (const byte of bytes) id += byte.toString(36).padStart(2, "0");
-  return id.slice(0, 12);
+  return id;
 }
 
 /** Resolves a stream or POST path against the page; `ws` swaps `http(s):` for `ws(s):`. @internal */

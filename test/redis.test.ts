@@ -321,6 +321,27 @@ if (!AVAILABLE) {
     });
   });
 
+  describe("restarted numbering", () => {
+    it("[RT-REV-8] delivers the first message after the channel's keys were lost, instead of dropping it as a repeat", async () => {
+      const { adapter } = redis.open();
+      const raw = redis.raw();
+      const seen: { readonly seq: number; readonly data: string }[] = [];
+      await adapter.subscribe("a", (message) =>
+        seen.push({ seq: message.seq, data: message.data }),
+      );
+      await adapter.publish("a", entry(1), RULES);
+      await adapter.publish("a", entry(2), RULES);
+      await until(() => seen.length === 2);
+      const base = `${redis.prefix()}:{a}`;
+      await raw.sendCommand(["DEL", `${base}:m`, `${base}:l`, `${base}:t`]);
+      // The accepted-at time has millisecond resolution: the restarted message must be later than the last one delivered.
+      await sleep(5);
+      await adapter.publish("a", entry(3), RULES);
+      await until(() => seen.length === 3);
+      expect(seen[2]).toEqual({ seq: 1, data: "3" });
+    });
+  });
+
   describe("reconnect", () => {
     it("[RT-RD-20] recovers every message published while the subscriber connection was down, once and in order", async () => {
       const [reader, writer] = [redis.open(), redis.open()];

@@ -11,7 +11,7 @@ import { createHubCore, type HubCore, type HubOptions } from "./hub";
 import type { Identity } from "./rules";
 
 export type { Adapter } from "../adapter";
-export { memoryAdapter } from "../memory";
+export { type MemoryAdapterOptions, type MemoryErrorContext, memoryAdapter } from "../memory";
 export type {
   AuthenticateResult,
   HubRouteOptions,

@@ -56,15 +56,26 @@ function deferred(): Deferred {
 class Pump<T> {
   readonly #queue: T[] = [];
   readonly #max: number;
+  readonly #onDrop: () => void;
   #wake: (() => void) | undefined;
   #stopped = false;
 
-  constructor(max: number) {
+  /**
+   * @param max The most items waiting for the loop.
+   * @param onDrop Called for every item refused because the queue is full, so the owner can report it and repair what the
+   * listener missed. It runs inside `push`, so it must not call back into this pump.
+   */
+  constructor(max: number, onDrop: () => void) {
     this.#max = max;
+    this.#onDrop = onDrop;
   }
 
   push(item: T): void {
-    if (this.#stopped || this.#queue.length >= this.#max) return;
+    if (this.#stopped) return;
+    if (this.#queue.length >= this.#max) {
+      this.#onDrop();
+      return;
+    }
     this.#queue.push(item);
     const wake = this.#wake;
     this.#wake = undefined;
@@ -83,12 +94,16 @@ class Pump<T> {
     deliver: (item: T) => void,
     report: (error: unknown) => void,
     every: (() => () => void) | undefined,
+    idle?: () => void,
   ): Promise<void> {
     const cancel = every?.();
     try {
       while (!this.#stopped) {
         const item = this.#queue.shift();
         if (item === undefined) {
+          // The queue just emptied: the owner may refill it (to repair what a full queue refused) before the loop sleeps.
+          idle?.();
+          if (this.#queue.length > 0) continue;
           await new Promise<void>((resolve) => {
             this.#wake = resolve;
           });
@@ -111,11 +126,17 @@ interface MessageSub {
   readonly pump: Pump<StoredMessage>;
   /** The highest seq queued for this listener; -1 until the link tells the head. */
   last: number;
+  /** True from the first message refused by a full queue until the queue has emptied (one report per overflow). */
+  overflowed: boolean;
 }
 
 interface PresenceSub {
   readonly listener: (event: PresenceEvent) => void;
   readonly pump: Pump<PresenceEvent>;
+  /** The members this listener has been given: what a resync is computed against. */
+  readonly view: Map<string, Member>;
+  /** True after an event was refused by a full queue and until the resync has been queued. */
+  stale: boolean;
 }
 
 /** A way to stop one listener. @internal */
@@ -165,14 +186,19 @@ export class ChannelLink {
   addMessages(listener: (message: StoredMessage) => void): LinkSubscription {
     const sub: MessageSub = {
       listener,
-      pump: new Pump(this.#host.maxQueued),
+      pump: new Pump(this.#host.maxQueued, () => this.#dropped(sub)),
       last: this.#state === "open" ? this.#last : -1,
+      overflowed: false,
     };
     this.#messages.add(sub);
+    // A refused message is not retried here: the listener's next message has a gap before it, which the hub fills from history.
     void sub.pump.run(
       listener,
       (error) => this.#host.report(error, "listener", this.channel),
       this.#nudger(),
+      () => {
+        sub.overflowed = false;
+      },
     );
     this.#start();
     return sub;
@@ -180,15 +206,63 @@ export class ChannelLink {
 
   /** Adds a presence listener (call it in the request that will receive events). */
   addPresence(listener: (event: PresenceEvent) => void): LinkSubscription {
-    const sub: PresenceSub = { listener, pump: new Pump(this.#host.maxQueued) };
+    const sub: PresenceSub = {
+      listener,
+      pump: new Pump(this.#host.maxQueued, () => this.#dropped(sub)),
+      view: new Map(),
+      stale: false,
+    };
     this.#presence.add(sub);
     void sub.pump.run(
-      listener,
+      (event) => {
+        // The view follows what the listener was given, even when it throws on it.
+        if (event.op === "leave") sub.view.delete(event.member.id);
+        else sub.view.set(event.member.id, event.member);
+        listener(event);
+      },
       (error) => this.#host.report(error, "listener", this.channel),
       this.#nudger(),
+      () => this.#resync(sub),
     );
     this.#start();
     return sub;
+  }
+
+  /** A listener's queue refused an item: reported once per overflow, and a presence listener is marked for a resync. */
+  #dropped(sub: MessageSub | PresenceSub): void {
+    if ("view" in sub) {
+      if (sub.stale) return;
+      sub.stale = true;
+    } else {
+      if (sub.overflowed) return;
+      sub.overflowed = true;
+    }
+    this.#host.report(
+      new RealtimeError(
+        "limit",
+        "a listener fell behind: its queue is full and events were dropped",
+      ),
+      "queue",
+      this.channel,
+    );
+  }
+
+  /**
+   * Called when a presence listener has caught up: after a drop it is sent the difference between what it was given and the
+   * member set the link holds (leaves, joins, changes), so one overflow cannot leave its picture of the room wrong for good.
+   * When the difference is larger than the queue, the rest follows at the next catch-up.
+   */
+  #resync(sub: PresenceSub): void {
+    if (!sub.stale) return;
+    sub.stale = false;
+    const current = this.#members ?? new Map<string, Member>();
+    for (const [id, member] of sub.view)
+      if (!current.has(id)) sub.pump.push({ channel: this.channel, op: "leave", member });
+    for (const [id, member] of current) {
+      const seen = sub.view.get(id);
+      if (seen === undefined) sub.pump.push({ channel: this.channel, op: "join", member });
+      else if (member.v > seen.v) sub.pump.push({ channel: this.channel, op: "set", member });
+    }
   }
 
   /** Removes a listener; the last one closes the link. */

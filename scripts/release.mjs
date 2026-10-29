@@ -11,12 +11,14 @@
 // provenance (a registry on this machine has no provider to attest the build). No dependencies: it runs before `npm install`.
 import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const DEFAULT_REGISTRY = "https://registry.npmjs.org";
 /** Scopes whose packages are published by the other repositories of the project. */
 const SIBLING = /^(?:@shadow-js\/|create-shadow-app$)/;
+/** `owner/name` of a GitHub address in any of its forms (https, git+https, ssh), without `.git`. */
+const GITHUB_REPOSITORY = /github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?\/?$/i;
 
 /**
  * The packages of a repository: the root when it is one, else the workspace members. Private packages are left out.
@@ -117,7 +119,8 @@ export function problemsOf(packages, repository) {
     if (typeof url !== "string") problems.push(`${name}: package.json has no repository.url`);
     else if (
       repository !== undefined &&
-      !url.toLowerCase().includes(`github.com/${repository.toLowerCase()}`)
+      // The whole owner/name: a prefix match would accept `org/router-extra` for `org/router`.
+      GITHUB_REPOSITORY.exec(url)?.[1]?.toLowerCase() !== repository.toLowerCase()
     )
       problems.push(`${name}: repository.url is ${url}, but the workflow runs in ${repository}`);
   }
@@ -146,13 +149,37 @@ export function siblingDependencies(packages) {
   return [...needs.values()];
 }
 
-/** Runs npm without a shell on POSIX; Windows needs one for the `.cmd` shim. */
+/**
+ * How to start npm without a shell. On Windows `npm.cmd` can only be started through cmd.exe, which reads `>=1.0.0` as a redirect
+ * and `^1.0.0` as an escape, so npm runs as a Node script there (the one next to the Node binary, or the one `npm run` names).
+ * @param {NodeJS.Platform} [platform] The platform (tests pass another).
+ * @param {NodeJS.ProcessEnv} [env] The environment.
+ * @param {string} [execPath] The Node binary.
+ * @param {(file: string) => boolean} [exists] Whether a file exists.
+ * @param {typeof import("node:path")} [path] The path rules of the platform.
+ * @returns {{ command: string, args: string[] }} The command and the arguments that come before npm's own.
+ * @throws {Error} On Windows, when no npm CLI script is found.
+ */
+export function npmInvocation(
+  platform = process.platform,
+  env = process.env,
+  execPath = process.execPath,
+  exists = existsSync,
+  path = { join, dirname },
+) {
+  if (platform !== "win32") return { command: "npm", args: [] };
+  const fromEnv = env.npm_execpath;
+  if (fromEnv !== undefined && /\.[cm]?js$/.test(fromEnv) && exists(fromEnv))
+    return { command: execPath, args: [fromEnv] };
+  const beside = path.join(path.dirname(execPath), "node_modules", "npm", "bin", "npm-cli.js");
+  if (exists(beside)) return { command: execPath, args: [beside] };
+  throw new Error(`cannot find the npm CLI next to ${execPath}; run this through \`npm run\``);
+}
+
+/** Runs npm without a shell. */
 function npm(args, options = {}) {
-  return spawnSync(process.platform === "win32" ? "npm.cmd" : "npm", args, {
-    encoding: "utf8",
-    shell: process.platform === "win32",
-    ...options,
-  });
+  const { command, args: prefix } = npmInvocation();
+  return spawnSync(command, [...prefix, ...args], { encoding: "utf8", shell: false, ...options });
 }
 
 /**
@@ -336,8 +363,12 @@ export async function plan(root, registry) {
  */
 export async function main(argv, root) {
   const [command, ...rest] = argv;
-  const option = (flag, fallback) =>
-    rest.includes(flag) ? rest[rest.indexOf(flag) + 1] : fallback;
+  const option = (flag, fallback) => {
+    if (!rest.includes(flag)) return fallback;
+    const value = rest[rest.indexOf(flag) + 1];
+    if (value === undefined || value.startsWith("--")) throw new Error(`${flag} needs a value`);
+    return value;
+  };
   const registry = option(
     "--registry",
     process.env.RELEASE_REGISTRY ?? process.env.npm_config_registry ?? DEFAULT_REGISTRY,
@@ -351,7 +382,11 @@ export async function main(argv, root) {
         `pending=${result.pending}\nversion=${result.version}\n`,
       );
   } else if (command === "wait") {
-    await waitForDependencies(root, registry, Number(option("--timeout-minutes", "45")));
+    const minutes = Number(option("--timeout-minutes", "45"));
+    // NaN would make `elapsed > NaN` false for ever: the wait would never give up.
+    if (!Number.isFinite(minutes) || minutes <= 0)
+      throw new Error("--timeout-minutes needs a positive number");
+    await waitForDependencies(root, registry, minutes);
   } else if (command === "install") {
     await installWithRetry(root, rest);
   } else if (command === "publish") {

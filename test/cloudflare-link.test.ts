@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ChannelLink, type LinkHost } from "../src/cloudflare/link";
 import type { ClientSocket } from "../src/cloudflare/types";
 import type { LinkFrame } from "../src/cloudflare/wire";
+import { RealtimeError } from "../src/errors";
 import type { StoredMessage } from "../src/protocol";
 
 /** A client socket the test drives by hand. */
@@ -56,7 +57,7 @@ class ScriptedHost implements LinkHost {
   readonly reconnectMaxMs = 1000;
   readonly keepAliveMs = 1000;
   readonly connectTimeoutMs = 500;
-  readonly maxQueued = 100;
+  readonly maxQueued: number = 100;
   clock = 1_000_000;
   readonly sockets: ScriptedSocket[] = [];
   readonly opened: (number | undefined)[] = [];
@@ -304,5 +305,48 @@ describe("channel link: frames", () => {
       host.advance(2000);
     }
     expect(delays).toEqual([99, 199, 399, 799, 999, 999]);
+  });
+});
+
+class SmallHost extends ScriptedHost {
+  override readonly maxQueued: number = 3;
+}
+
+describe("channel link: a listener queue that overflows", () => {
+  it("[RT-R2-5] a presence listener that lost events is told so and resynced to the true member set", async () => {
+    const host = new SmallHost();
+    const link = linkOn(host);
+    const view = new Map<string, number>();
+    link.addPresence((event) => {
+      if (event.op === "leave") view.delete(event.member.id);
+      else view.set(event.member.id, event.member.v);
+    });
+    await flush();
+    host.sockets[0]?.emit(ready(0));
+    await flush();
+    const member = (id: string, v = 1) => ({ id, s: null, v });
+    // Five changes arrive in one tick; the queue holds three.
+    for (const id of ["a", "b", "c", "d"])
+      host.sockets[0]?.emit({ t: "pres", op: "join", member: member(id) });
+    host.sockets[0]?.emit({ t: "pres", op: "leave", member: member("a") });
+    host.sockets[0]?.emit({ t: "pres", op: "set", member: member("b", 2) });
+    await flush();
+    expect(host.reports.filter((item) => item instanceof RealtimeError)).toHaveLength(1);
+    expect(Object.fromEntries(view)).toEqual({ b: 2, c: 1, d: 1 });
+  });
+
+  it("[RT-R2-5] a message listener that lost messages is reported, once per overflow", async () => {
+    const host = new SmallHost();
+    const link = linkOn(host);
+    const seen: number[] = [];
+    link.addMessages((item) => seen.push(item.seq));
+    await flush();
+    host.sockets[0]?.emit(ready(0));
+    await flush();
+    for (let seq = 1; seq <= 8; seq += 1) host.sockets[0]?.emit({ t: "msg", m: message(seq) });
+    await flush();
+    expect(seen).toEqual([1, 2, 3]);
+    expect(host.reports).toHaveLength(1);
+    expect(host.reports[0]).toBeInstanceOf(RealtimeError);
   });
 });

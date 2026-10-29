@@ -1,5 +1,5 @@
 import { RealtimeError } from "../errors";
-import { byteLength, type Json } from "../protocol";
+import type { Json } from "../protocol";
 import type { HubConnection, HubCore, Transport } from "./hub";
 import { TokenBucket } from "./limits";
 import type { Identity } from "./rules";
@@ -52,15 +52,43 @@ export interface SseLike {
 }
 
 const KEY = "$realtime";
+/** Marks a socket that closed before its connection existed. */
+const GONE = "$realtime:gone";
 const MAX_FRAMES_PER_POST = 64;
 const MAX_SUBSCRIPTIONS_IN_QUERY = 64;
 const MAX_BUCKETS = 10_000;
 
-function refuse(status: number, code: RealtimeError["code"], message: string): Response {
-  return new Response(JSON.stringify({ error: { code, message } }), {
+/** A JSON answer that no cache may keep. */
+function jsonResponse(status: number, body: string): Response {
+  return new Response(body, {
     status,
     headers: { "content-type": "application/json", "cache-control": "no-store" },
   });
+}
+
+function refuse(
+  status: number,
+  code: RealtimeError["code"],
+  message: string | undefined,
+): Response {
+  return jsonResponse(status, JSON.stringify({ error: { code, message } }));
+}
+
+/**
+ * Reads a request body as text, stopping at `max` bytes: a body that never ends must not be held in memory before it is
+ * refused. Undefined when the body is larger than `max`.
+ */
+async function readBounded(request: Request, max: number): Promise<string | undefined> {
+  const decoder = new TextDecoder();
+  let text = "";
+  let bytes = 0;
+  // Leaving the loop early cancels the stream, so the rest of an oversized body is never pulled.
+  for await (const chunk of (request.body ?? []) as AsyncIterable<Uint8Array>) {
+    bytes += chunk.byteLength;
+    if (bytes > max) return undefined;
+    text += decoder.decode(chunk, { stream: true });
+  }
+  return text + decoder.decode();
 }
 
 /** Whether the request's `Origin` header is acceptable. A missing header is allowed (see `HubRouteOptions.allowedOrigins`). */
@@ -110,8 +138,11 @@ export function websocketRoute<E extends RequestLike>(
     },
     async open(ws, event) {
       const result = await identify(options, event);
+      // `authenticate` can take a while: a peer that left in the meantime already had its `close`, which found no connection to
+      // release, so connecting now would leave one in the hub for good.
+      if (ws.signal.aborted || ws.data[GONE] === true) return;
       if ("refusal" in result) {
-        ws.close(1008, "unauthorized");
+        ws.close(1008, __DEV__ ? "unauthorized" : "");
         return;
       }
       const transport: Transport = {
@@ -124,12 +155,13 @@ export function websocketRoute<E extends RequestLike>(
       const connection = ws.data[KEY] as HubConnection | undefined;
       if (connection === undefined) return;
       if (typeof message !== "string") {
-        ws.close(1003, "binary frames are not supported");
+        ws.close(1003, __DEV__ ? "binary frames are not supported" : "");
         return;
       }
       connection.receive(message);
     },
     close(ws) {
+      ws.data[GONE] = true;
       (ws.data[KEY] as HubConnection | undefined)?.closed();
     },
     error(ws, error) {
@@ -188,18 +220,20 @@ export function sseRoute<E extends RequestLike>(
 ): (event: E, stream: SseLike) => Promise<void> {
   return async (event, stream) => {
     if (!originAllowed(event.request, options.allowedOrigins)) {
-      hub.report(new RealtimeError("forbidden", "origin refused"), { where: "sse.origin" });
-      await refuseStream(stream, "origin not allowed");
+      hub.report(new RealtimeError("forbidden", __DEV__ ? "origin refused" : undefined), {
+        where: "sse.origin",
+      });
+      await refuseStream(stream, __DEV__ ? "origin not allowed" : "");
       return;
     }
     const result = await identify(options, event);
-    if ("refusal" in result) {
-      await refuseStream(stream, "unauthorized");
-      return;
-    }
-    const entries = declared(new URL(event.request.url));
-    if (entries === undefined) {
-      await refuseStream(stream, "bad subscription list");
+    // The list is read only for an identified connection; either refusal ends the stream the same way.
+    const entries = "refusal" in result ? undefined : declared(new URL(event.request.url));
+    if ("refusal" in result || entries === undefined) {
+      await refuseStream(
+        stream,
+        __DEV__ ? ("refusal" in result ? "unauthorized" : "bad subscription list") : "",
+      );
       return;
     }
     let pendingBytes = 0;
@@ -223,7 +257,8 @@ export function sseRoute<E extends RequestLike>(
     };
     const connection = hub.connect(transport, result.identity);
     entries.forEach((entry, at) => {
-      connection.receive(JSON.stringify({ t: "sub", n: at + 1, ...entry }));
+      // The type and the number come last: an entry that names its own `t` must not turn a declaration into a publish.
+      connection.receive(JSON.stringify({ ...entry, t: "sub", n: at + 1 }));
     });
     if (!stream.signal.aborted)
       await new Promise<void>((resolve) => {
@@ -272,22 +307,26 @@ export function postRoute<E extends RequestLike>(
   return async (event) => {
     const { request } = event;
     if (!originAllowed(request, options.allowedOrigins))
-      return refuse(403, "forbidden", "origin not allowed");
+      return refuse(403, "forbidden", __DEV__ ? "origin not allowed" : undefined);
     const result = await identify(options, event);
     if ("refusal" in result) return result.refusal;
-    const text = await request.text();
-    if (byteLength(text) > hub.limits.maxMessageBytes * 8)
-      return refuse(413, "too_large", "the request is too large");
+    const text = await readBounded(request, hub.limits.maxMessageBytes * 8);
+    if (text === undefined)
+      return refuse(413, "too_large", __DEV__ ? "the request is too large" : undefined);
     let body: unknown;
     try {
       body = JSON.parse(text);
     } catch {
-      return refuse(400, "bad_frame", "the body is not JSON");
+      return refuse(400, "bad_frame", __DEV__ ? "the body is not JSON" : undefined);
     }
     const frames = (body as { frames?: unknown } | null)?.frames;
     const cid = (body as { cid?: unknown } | null)?.cid;
     if (!Array.isArray(frames) || frames.length === 0 || frames.length > MAX_FRAMES_PER_POST)
-      return refuse(400, "bad_frame", `frames must hold 1..${MAX_FRAMES_PER_POST} frames`);
+      return refuse(
+        400,
+        "bad_frame",
+        __DEV__ ? `frames must hold 1..${MAX_FRAMES_PER_POST} frames` : undefined,
+      );
     const key = options.key?.(event, result.identity) ?? result.identity.user ?? "anonymous";
     const answers: string[] = [];
     const transport: Transport = {
@@ -309,7 +348,12 @@ export function postRoute<E extends RequestLike>(
           const item = frame as { c?: unknown; s?: unknown };
           try {
             if (typeof item.c !== "string" || typeof cid !== "string")
-              throw new RealtimeError("bad_frame", "pres needs c and the connection id");
+              throw new RealtimeError(
+                "bad_frame",
+                __DEV__ ? "pres needs c and the connection id" : undefined,
+              );
+            // Each change costs the adapter two calls: it spends from the same bucket as a publish, as it does on a socket.
+            if (!bucketFor(key).take(Date.now())) throw new RealtimeError("rate_limited");
             await hub.setMemberState(result.identity, item.c, cid, (item.s ?? null) as Json);
           } catch (error) {
             const code = error instanceof RealtimeError ? error.code : "unavailable";
@@ -319,7 +363,11 @@ export function postRoute<E extends RequestLike>(
         }
         if (type !== "pub" && type !== "req") {
           answers.push(
-            JSON.stringify({ t: "err", code: "bad_frame", msg: "only pub, req and pres" }),
+            JSON.stringify({
+              t: "err",
+              code: "bad_frame",
+              msg: __DEV__ ? "only pub, req and pres" : undefined,
+            }),
           );
           continue;
         }
@@ -329,9 +377,6 @@ export function postRoute<E extends RequestLike>(
     } finally {
       connection.closed();
     }
-    return new Response(`{"frames":[${answers.join(",")}]}`, {
-      status: 200,
-      headers: { "content-type": "application/json", "cache-control": "no-store" },
-    });
+    return jsonResponse(200, `{"frames":[${answers.join(",")}]}`);
   };
 }

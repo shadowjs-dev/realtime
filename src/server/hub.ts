@@ -161,6 +161,8 @@ interface SubState {
   readonly watch: boolean;
   joined: boolean;
   version: number;
+  /** The state this connection last published to the presence set, to write it back if the entry expired. */
+  state: Json;
   lastSeq: number;
   /** The `at` of the last message delivered: a message with an old seq but a newer `at` means the numbering restarted. */
   lastAt: number;
@@ -192,6 +194,8 @@ interface ConnState {
   readonly subs: Map<string, SubState>;
   readonly queue: string[];
   readonly publishBucket: TokenBucket;
+  /** Spent by `sub` and `unsub` frames: subscription churn costs the adapter (and Redis) work like a publish does. */
+  readonly controlBucket: TokenBucket;
   readonly invalid: WindowCounter;
   readonly limited: WindowCounter;
   readonly pending: Set<AbortController>;
@@ -209,11 +213,11 @@ const ID_BYTES = 16;
 
 /** A random id: 128 bits, base64url. */
 function randomId(): string {
-  const bytes = new Uint8Array(ID_BYTES);
-  crypto.getRandomValues(bytes);
-  let text = "";
-  for (const byte of bytes) text += String.fromCharCode(byte);
-  return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const bytes = crypto.getRandomValues(new Uint8Array(ID_BYTES));
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
 }
 
 function encodeFrame(frame: Record<string, unknown>): string {
@@ -251,7 +255,13 @@ export function createHubCore(options: HubOptions = {}): HubCore {
   const limits = resolveLimits(options.limits);
   const now = options.now ?? Date.now;
   const ownsAdapter = options.adapter === undefined;
-  const adapter = options.adapter ?? memoryAdapter({ now });
+  const adapter =
+    options.adapter ??
+    memoryAdapter({
+      now,
+      onError: (error, context) =>
+        report(error, { where: `memory.${context.where}`, channel: context.channel }),
+    });
   const rules: CompiledRule[] = [];
   const conns = new Map<string, ConnState>();
   const chans = new Map<string, ChanState>();
@@ -296,7 +306,10 @@ export function createHubCore(options: HubOptions = {}): HubCore {
       return (await permission({ channel, params, identity, op })) === true;
     } catch (error) {
       report(error, { where: `rule.${op}`, channel });
-      throw new RealtimeError("unavailable", "the channel rule could not be evaluated");
+      throw new RealtimeError(
+        "unavailable",
+        __DEV__ ? "the channel rule could not be evaluated" : undefined,
+      );
     }
   }
 
@@ -306,15 +319,28 @@ export function createHubCore(options: HubOptions = {}): HubCore {
       const buffered = conn.transport.buffered?.() ?? 0;
       if (buffered > limits.maxBufferedBytes) {
         counters.slowConsumers += 1;
-        drop(conn, 1013, "slow consumer");
+        drop(conn, 1013, __DEV__ ? "slow consumer" : "");
         return;
       }
       if (conn.transport.send(text)) return;
     } catch (error) {
-      // A transport that throws is a broken socket: this connection goes, the others are not affected (guarantee G13).
+      // A transport that throws is a broken socket: this connection goes, the others are not affected (guarantee G13). The
+      // transport is closed too, or its peer would keep a socket the hub no longer answers on until its own heartbeat gave up.
       report(error, { where: "transport.send", connection: conn.id });
+      onTransport(conn, "transport.close", () =>
+        conn.transport.close(1011, __DEV__ ? "write failed" : ""),
+      );
     }
     void closeConnection(conn);
+  }
+
+  /** Runs a call on the transport; a transport that is already gone throws, which is only reported. */
+  function onTransport(conn: ConnState, where: string, call: () => unknown): void {
+    try {
+      call();
+    } catch (error) {
+      report(error, { where, connection: conn.id });
+    }
   }
 
   function sendFrame(conn: ConnState, frame: Record<string, unknown>): void {
@@ -334,23 +360,18 @@ export function createHubCore(options: HubOptions = {}): HubCore {
       ...(n === undefined ? {} : { n }),
       ...(channel === undefined ? {} : { c: channel }),
       code,
-      ...(message === undefined ? {} : { msg: message }),
+      ...(message === undefined || message === "" ? {} : { msg: message }),
     });
   }
 
   /** Sends a final frame, closes the transport and releases the connection. */
   function drop(conn: ConnState, code: number, reason: string): void {
     if (conn.closed) return;
-    try {
-      conn.transport.send(encodeFrame({ t: "bye", code, why: reason }));
-    } catch {
-      // The transport may already be gone.
-    }
-    try {
-      conn.transport.close(code, reason);
-    } catch {
-      // See above.
-    }
+    // The connection is released whatever the transport does, so its failures are only reported.
+    onTransport(conn, "transport.send", () =>
+      conn.transport.send(encodeFrame({ t: "bye", code, why: reason })),
+    );
+    onTransport(conn, "transport.close", () => conn.transport.close(code, reason));
     void closeConnection(conn);
   }
 
@@ -377,24 +398,20 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     return chan;
   }
 
-  async function ensureAdapterSub(chan: ChanState): Promise<void> {
-    if (chan.adapterSub === undefined) {
-      chan.adapterSub = adapter.subscribe(chan.name, (message) => onMessage(chan, message));
-      chan.adapterSub.catch(() => {
-        chan.adapterSub = undefined;
+  /** Opens one of the channel's two adapter feeds once; a failed attempt is forgotten so the next caller retries. */
+  async function ensureFeed(
+    chan: ChanState,
+    key: "adapterSub" | "presenceSub",
+    open: () => Promise<Unsubscribe>,
+  ): Promise<void> {
+    if (chan[key] === undefined) {
+      const opened = open();
+      chan[key] = opened;
+      opened.catch(() => {
+        chan[key] = undefined;
       });
     }
-    await chan.adapterSub;
-  }
-
-  async function ensurePresenceSub(chan: ChanState): Promise<void> {
-    if (chan.presenceSub === undefined) {
-      chan.presenceSub = adapter.presenceSubscribe(chan.name, (event) => onPresence(chan, event));
-      chan.presenceSub.catch(() => {
-        chan.presenceSub = undefined;
-      });
-    }
-    await chan.presenceSub;
+    await chan[key];
   }
 
   function onMessage(chan: ChanState, message: StoredMessage): void {
@@ -486,6 +503,17 @@ export function createHubCore(options: HubOptions = {}): HubCore {
 
   function onPresence(chan: ChanState, event: PresenceEvent): void {
     for (const sub of chan.subs) {
+      // A change to this connection's own member made elsewhere (an HTTP post to another server) is what a write-back after an
+      // expiry has to carry, so the connection's copy follows it.
+      if (
+        sub.joined &&
+        event.op !== "leave" &&
+        event.member.id === sub.conn.id &&
+        event.member.v > sub.version
+      ) {
+        sub.version = event.member.v;
+        sub.state = event.member.s;
+      }
       if (!sub.active || (!sub.joined && !sub.watch)) continue;
       if (sub.presenceQueue !== undefined) sub.presenceQueue.push(event);
       else sendPresence(sub, event);
@@ -557,9 +585,16 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     frame: Extract<ClientFrame, { t: "sub" }>,
   ): Promise<void> {
     const { c: name, n } = frame;
-    if (conn.subs.has(name)) return fail(conn, n, "conflict", name, "already subscribed");
+    if (conn.subs.has(name))
+      return fail(conn, n, "conflict", name, __DEV__ ? "already subscribed" : undefined);
     if (conn.subs.size >= limits.maxChannelsPerConnection)
-      return fail(conn, n, "limit", name, "too many channels on this connection");
+      return fail(
+        conn,
+        n,
+        "limit",
+        name,
+        __DEV__ ? "too many channels on this connection" : undefined,
+      );
     const found = match(name);
     if (
       found === undefined ||
@@ -576,11 +611,17 @@ export function createHubCore(options: HubOptions = {}): HubCore {
       frame.hasPresence &&
       byteLength(JSON.stringify(frame.presence ?? null)) > limits.maxStateBytes
     )
-      return fail(conn, n, "too_large", name, "the presence state is too large");
+      return fail(
+        conn,
+        n,
+        "too_large",
+        name,
+        __DEV__ ? "the presence state is too large" : undefined,
+      );
     if (conn.closed) return;
     const chan = channelState(name);
     if (chan.subs.size >= limits.maxSubscribersPerChannel)
-      return fail(conn, n, "limit", name, "the channel is full");
+      return fail(conn, n, "limit", name, __DEV__ ? "the channel is full" : undefined);
     const sub: SubState = {
       conn,
       channel: chan,
@@ -590,6 +631,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
       watch: frame.watch === true,
       joined: false,
       version: 0,
+      state: null,
       lastSeq: 0,
       lastAt: now(),
       pumping: true,
@@ -602,9 +644,13 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     conn.subs.set(name, sub);
     chan.subs.add(sub);
     try {
-      await ensureAdapterSub(chan);
+      await ensureFeed(chan, "adapterSub", () =>
+        adapter.subscribe(chan.name, (message) => onMessage(chan, message)),
+      );
       if (wantsPresence) {
-        await ensurePresenceSub(chan);
+        await ensureFeed(chan, "presenceSub", () =>
+          adapter.presenceSubscribe(chan.name, (event) => onPresence(chan, event)),
+        );
         startHeartbeat();
       }
       const probe = await adapter.history(name, Number.MAX_SAFE_INTEGER, 0);
@@ -651,8 +697,9 @@ export function createHubCore(options: HubOptions = {}): HubCore {
   async function joinPresence(sub: SubState, state: Json): Promise<void> {
     const existing = await adapter.presenceList(sub.channel.name);
     if (existing.length >= limits.maxPresenceMembers)
-      throw new RealtimeError("limit", "the presence set is full");
+      throw new RealtimeError("limit", __DEV__ ? "the presence set is full" : undefined);
     sub.version = 1;
+    sub.state = state;
     sub.joined = true;
     startHeartbeat();
     const member: Member = {
@@ -691,9 +738,16 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     const sub = conn.subs.get(frame.c);
     if (sub === undefined || !sub.joined) return fail(conn, undefined, "not_subscribed", frame.c);
     if (byteLength(JSON.stringify(frame.s)) > limits.maxStateBytes)
-      return fail(conn, undefined, "too_large", frame.c, "the presence state is too large");
+      return fail(
+        conn,
+        undefined,
+        "too_large",
+        frame.c,
+        __DEV__ ? "the presence state is too large" : undefined,
+      );
     if (!conn.publishBucket.take(now())) return limit(conn, undefined, frame.c);
     sub.version += 1;
+    sub.state = frame.s;
     const member: Member = {
       id: conn.id,
       ...(conn.identity.user === undefined ? {} : { u: conn.identity.user }),
@@ -710,7 +764,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
 
   function limit(conn: ConnState, n: number | undefined, channel: string): void {
     fail(conn, n, "rate_limited", channel);
-    if (conn.limited.hit(now())) drop(conn, 1008, "rate limit exceeded");
+    if (conn.limited.hit(now())) drop(conn, 1008, __DEV__ ? "rate limit exceeded" : "");
   }
 
   async function publishFrame(
@@ -725,7 +779,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     )
       return fail(conn, n, identityDenied(conn), name);
     if (frame.d.length > limits.maxMessageBytes)
-      return fail(conn, n, "too_large", name, "the message is too large");
+      return fail(conn, n, "too_large", name, __DEV__ ? "the message is too large" : undefined);
     // A channel with no subscriber on this server has no bucket: only the connection's own rate applies to it.
     if (!conn.publishBucket.take(now()) || chans.get(name)?.bucket.take(now()) === false)
       return limit(conn, n, name);
@@ -782,7 +836,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     const handler = sub.rule.handlers?.[frame.e];
     if (handler === undefined) return fail(conn, n, "no_handler", name);
     if (conn.pending.size >= limits.maxPendingRequests)
-      return fail(conn, n, "limit", name, "too many requests in flight");
+      return fail(conn, n, "limit", name, __DEV__ ? "too many requests in flight" : undefined);
     if (!conn.publishBucket.take(now())) return limit(conn, n, name);
     const controller = new AbortController();
     conn.pending.add(controller);
@@ -808,7 +862,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
         const reply = (await Promise.race([run, aborted])) ?? null;
         const text = JSON.stringify(reply);
         if (text === undefined || byteLength(text) > limits.maxMessageBytes)
-          return fail(conn, n, "too_large", name, "the reply is too large");
+          return fail(conn, n, "too_large", name, __DEV__ ? "the reply is too large" : undefined);
         send(conn, `{"t":"rep","n":${n},"d":${text}}`);
       } catch (error) {
         if (error instanceof RealtimeError)
@@ -831,14 +885,33 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     })();
   }
 
+  /** Answers a frame that cannot be handled; a peer that keeps sending them is dropped. */
+  function refuseFrame(
+    conn: ConnState,
+    n: number | undefined,
+    code: RealtimeError["code"],
+    why?: string,
+  ): void {
+    fail(conn, n, code, undefined, why);
+    if (conn.invalid.hit(now())) drop(conn, 1008, __DEV__ ? "too many invalid frames" : "");
+  }
+
   async function handle(conn: ConnState, text: string): Promise<void> {
     const decoded = decodeClientFrame(text, limits.maxMessageBytes);
     if (!decoded.ok) {
-      fail(conn, decoded.n, decoded.code, undefined, decoded.why);
-      if (conn.invalid.hit(now())) drop(conn, 1008, "too many invalid frames");
+      refuseFrame(conn, decoded.n, decoded.code, decoded.why);
       return;
     }
     const frame = decoded.frame;
+    const n = "n" in frame ? frame.n : undefined;
+    // An `unsub` spends a token but is never refused: the client cannot tell a refused one (the answer names no frame), and would
+    // believe it left a channel the hub still holds, so its next `sub` of that channel would be a conflict.
+    if (
+      (frame.t === "sub" || frame.t === "unsub") &&
+      !conn.controlBucket.take(now()) &&
+      frame.t === "sub"
+    )
+      return limit(conn, n, frame.c);
     try {
       switch (frame.t) {
         case "hello":
@@ -862,7 +935,6 @@ export function createHubCore(options: HubOptions = {}): HubCore {
           return await setPresence(conn, frame);
       }
     } catch (error) {
-      const n = "n" in frame ? frame.n : undefined;
       const channel = "c" in frame ? frame.c : undefined;
       if (error instanceof RealtimeError) fail(conn, n, error.code, channel);
       else {
@@ -965,7 +1037,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
           {
             id: ref.id,
             ...(sub.conn.identity.user === undefined ? {} : { u: sub.conn.identity.user }),
-            s: null,
+            s: sub.state,
             v: sub.version,
           },
           limits.presenceTtlMs,
@@ -995,7 +1067,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     },
 
     connect(transport, identity = {}, connectOptions = {}) {
-      if (closing) throw new RealtimeError("closed", "the hub is closed");
+      if (closing) throw new RealtimeError("closed", __DEV__ ? "the hub is closed" : undefined);
       let release: () => void = () => undefined;
       const done = new Promise<void>((resolve) => {
         release = resolve;
@@ -1013,6 +1085,12 @@ export function createHubCore(options: HubOptions = {}): HubCore {
         publishBucket:
           connectOptions.publishBucket ??
           new TokenBucket(limits.publishesPerSecond, limits.publishBurst, now()),
+        // The refill is the publish rate; the burst always covers a connection declaring all its channels at once.
+        controlBucket: new TokenBucket(
+          limits.publishesPerSecond,
+          Math.max(limits.publishBurst, limits.maxChannelsPerConnection),
+          now(),
+        ),
         stateless: connectOptions.stateless === true,
         waiters: [],
         invalid: new WindowCounter(10, 60_000),
@@ -1038,8 +1116,14 @@ export function createHubCore(options: HubOptions = {}): HubCore {
         done,
         receive(text) {
           if (conn.closed) return;
+          // Judged before it takes a place in the queue: a frame over the limit can never be handled, so it must not be able to
+          // fill the queue (or be held until its turn) however many arrive.
+          if (byteLength(text) > limits.maxMessageBytes) {
+            refuseFrame(conn, undefined, "too_large");
+            return;
+          }
           if (conn.queue.length >= limits.maxQueuedFrames) {
-            drop(conn, 1013, "too many frames waiting");
+            drop(conn, 1013, __DEV__ ? "too many frames waiting" : "");
             return;
           }
           conn.queue.push(text);
@@ -1059,20 +1143,32 @@ export function createHubCore(options: HubOptions = {}): HubCore {
 
     async publish(channel, event, data, publishOptions = {}) {
       if (!isChannelName(channel))
-        throw new RealtimeError("bad_channel", `"${channel}" is not a valid channel name`);
+        throw new RealtimeError(
+          "bad_channel",
+          __DEV__ ? `"${channel}" is not a valid channel name` : undefined,
+        );
       if (!isEventName(event))
-        throw new RealtimeError("bad_frame", `"${event}" is not a valid event name`);
+        throw new RealtimeError(
+          "bad_frame",
+          __DEV__ ? `"${event}" is not a valid event name` : undefined,
+        );
       if (publishOptions.key !== undefined && !isIdempotencyKey(publishOptions.key))
-        throw new RealtimeError("bad_frame", "the idempotency key is not valid");
+        throw new RealtimeError(
+          "bad_frame",
+          __DEV__ ? "the idempotency key is not valid" : undefined,
+        );
       let text: string | undefined;
       try {
         text = JSON.stringify(data === undefined ? null : data);
       } catch (error) {
-        throw new TypeError("the data is not JSON", { cause: error });
+        throw new TypeError(__DEV__ ? "the data is not JSON" : "REALTIME_DATA", {
+          cause: error,
+        });
       }
-      if (text === undefined) throw new TypeError("the data is not JSON");
+      if (text === undefined)
+        throw new TypeError(__DEV__ ? "the data is not JSON" : "REALTIME_DATA");
       if (byteLength(text) > limits.maxMessageBytes)
-        throw new RealtimeError("too_large", "the message is too large");
+        throw new RealtimeError("too_large", __DEV__ ? "the message is too large" : undefined);
       const found = match(channel);
       const result = await adapter.publish(
         channel,
@@ -1090,7 +1186,10 @@ export function createHubCore(options: HubOptions = {}): HubCore {
 
     async setMemberState(identity, channel, connectionId, state) {
       if (identity.user === undefined)
-        throw new RealtimeError("unauthorized", "presence changes over HTTP need a signed-in user");
+        throw new RealtimeError(
+          "unauthorized",
+          __DEV__ ? "presence changes over HTTP need a signed-in user" : undefined,
+        );
       const found = match(channel);
       if (
         found === undefined ||
@@ -1098,14 +1197,25 @@ export function createHubCore(options: HubOptions = {}): HubCore {
       )
         throw new RealtimeError("forbidden");
       if (byteLength(JSON.stringify(state)) > limits.maxStateBytes)
-        throw new RealtimeError("too_large", "the presence state is too large");
+        throw new RealtimeError(
+          "too_large",
+          __DEV__ ? "the presence state is too large" : undefined,
+        );
       const members = await adapter.presenceList(channel);
       const member = members.find((item) => item.id === connectionId);
       if (member === undefined || member.u !== identity.user)
-        throw new RealtimeError("forbidden", "that connection is not yours");
+        throw new RealtimeError("forbidden", __DEV__ ? "that connection is not yours" : undefined);
+      // The connection may live on this server: its own copy of the member is what the heartbeat writes back after an expiry, so
+      // it moves with the stored one (the same for a connection on another server, through the presence event below).
+      const local = conns.get(connectionId)?.subs.get(channel);
+      const version = Math.max(member.v, local?.version ?? 0) + 1;
+      if (local?.joined === true) {
+        local.version = version;
+        local.state = state;
+      }
       await adapter.presenceSet(
         channel,
-        { id: member.id, u: member.u, s: state, v: member.v + 1 },
+        { id: member.id, u: member.u, s: state, v: version },
         limits.presenceTtlMs,
       );
     },
@@ -1116,7 +1226,9 @@ export function createHubCore(options: HubOptions = {}): HubCore {
         target.connection === undefined &&
         target.channel === undefined
       )
-        throw new TypeError("revoke needs a user, a connection or a channel.");
+        throw new TypeError(
+          __DEV__ ? "revoke needs a user, a connection or a channel." : "REALTIME_REVOKE",
+        );
       let count = 0;
       for (const conn of [...conns.values()]) {
         if (target.connection !== undefined && conn.id !== target.connection) continue;
@@ -1147,7 +1259,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
       if (heartbeat !== undefined) clearInterval(heartbeat);
       heartbeat = undefined;
       const all = [...conns.values()];
-      for (const conn of all) drop(conn, 1001, "going away");
+      for (const conn of all) drop(conn, 1001, __DEV__ ? "going away" : "");
       await Promise.all(all.map((conn) => conn.done));
       await Promise.allSettled([...releasing]);
       if (ownsAdapter) await adapter.close();

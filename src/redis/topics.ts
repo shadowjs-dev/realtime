@@ -2,9 +2,14 @@ import type { Unsubscribe } from "../adapter";
 import type { Member, PresenceEvent, StoredMessage } from "../protocol";
 import type { RedisSubscriber } from "./client";
 
-/** Where a failure the adapter handled came from. */
+/**
+ * Where a failure the adapter handled came from.
+ * @since 1.0.0
+ */
 export interface RedisErrorContext {
+  /** The step that failed, for example `"parse"`, `"listener"`, `"reconnect"` or `"subscriber"`. */
   readonly where: string;
+  /** The channel it concerned, when it concerned one. */
   readonly channel?: string;
 }
 
@@ -67,6 +72,8 @@ interface MessageTopic extends TopicBase {
   readonly listeners: Set<MessageListener>;
   /** The highest seq handed to the listeners: nothing at or below it is delivered again. */
   last: number;
+  /** When the message at `last` was accepted: a lower seq accepted later is a restarted numbering, not a repeat. */
+  lastAt: number;
   /** True while history is being read to fill a gap: live messages wait in `buffer`. */
   catching: boolean;
   /** Set when a reconnect happened while a recovery was running: it reads once more. */
@@ -123,8 +130,13 @@ export function createTopics(deps: TopicsDeps): Topics {
   // --- delivery ------------------------------------------------------------------------------------------------------
 
   function emit(topic: MessageTopic, message: StoredMessage): void {
-    if (topic.dead || message.seq <= topic.last) return;
+    if (topic.dead) return;
+    // Redis stamps `at` itself, so a repeat carries the time it first had. A lower seq with a later time means the keys were
+    // lost (a flush, a failover to a replica that lacked them) and numbering began again: dropping it would silence the
+    // channel until the new numbers pass the old ones. The hub tells its subscribers `reset` when it sees one.
+    if (message.seq <= topic.last && message.at <= topic.lastAt) return;
     topic.last = message.seq;
+    topic.lastAt = Math.max(topic.lastAt, message.at);
     for (const listener of [...topic.listeners]) {
       try {
         listener(message);
@@ -435,6 +447,7 @@ export function createTopics(deps: TopicsDeps): Topics {
             topic: key,
             listeners: new Set(),
             last: 0,
+            lastAt: 0,
             catching: false,
             rerun: false,
             buffer: [],

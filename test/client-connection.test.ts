@@ -34,6 +34,52 @@ describe("reconnect", () => {
     expect(r.rt.status).toBe("reconnecting");
   });
 
+  it("[RT-R5-8] maxReconnectAttempts ends the reconnecting: status closed, the error reported, pending publishes rejected", async () => {
+    vi.useFakeTimers();
+    const r = make({ reconnect: { random: () => 1, maxReconnectAttempts: 3 } });
+    r.sockets.refuseAll();
+    const lobby = r.rt.channel("chat:lobby");
+    lobby.on("message", () => undefined);
+    const pending = lobby.publish("message", 1);
+    const rejected = expect(pending).rejects.toMatchObject({ code: "closed" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(r.sockets.sockets).toHaveLength(1);
+    // Three reconnects (after 250, 500 and 1000 ms), then the fourth failure is final.
+    for (const delay of [250, 500, 1000]) {
+      await vi.advanceTimersByTimeAsync(delay);
+    }
+    expect(r.sockets.sockets).toHaveLength(4);
+    expect(r.rt.status).toBe("closed");
+    expect(lobby.status).toBe("closed");
+    expect(r.errors).toHaveLength(1);
+    expect(r.errors[0]).toMatchObject({ code: "closed" });
+    expect(String((r.errors[0] as Error).message)).toContain("3");
+    await rejected;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(r.sockets.sockets).toHaveLength(4);
+  });
+
+  it("[RT-R5-8] the count restarts after a connection that stayed open stableMs, and 0 allows no reconnect", async () => {
+    vi.useFakeTimers();
+    const r = make({ reconnect: { random: () => 0, stableMs: 1000, maxReconnectAttempts: 1 } });
+    r.rt.channel("chat:lobby").on("message", () => undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    // Each drop is followed by a stable connection, so the one allowed reconnect is never used up.
+    for (let round = 0; round < 3; round += 1) {
+      r.sockets.sockets.at(-1)?.drop();
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(r.rt.status).toBe("open");
+    }
+    const none = make({ reconnect: { random: () => 0, maxReconnectAttempts: 0 } });
+    none.rt.channel("chat:lobby").on("message", () => undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    none.sockets.sockets.at(-1)?.drop();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(none.rt.status).toBe("closed");
+    expect(none.sockets.sockets).toHaveLength(1);
+  });
+
   it("[RT-R10] jitter is uniform below the cap: a source of 0 reconnects at once, one of 0.5 halves the delay", async () => {
     vi.useFakeTimers();
     const half = make({ reconnect: { random: () => 0.5 } });

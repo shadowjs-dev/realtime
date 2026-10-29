@@ -104,6 +104,41 @@ Root, `@shadow-js/realtime`: the wire protocol and shared types.
 `@shadow-js/realtime/cloudflare`: `cloudflareAdapter`, `RealtimeChannelObject`.
 `@shadow-js/realtime/testing`: `connectTest`, `adapterConformance`.
 
+## Production error codes
+
+A production build keeps a short code instead of the development explanation, so message text never reaches user bundles. Search this table for the code. In the explanation, `…` stands for a value the development message names. A code followed by a word names the option, feature or member at fault.
+
+| Code | Development explanation |
+| --- | --- |
+| `REALTIME_CLOSED` | the adapter is closed. |
+| `REALTIME_DATA` | the data is not JSON |
+| `REALTIME_FRAME_1` | after must be a non-negative integer |
+| `REALTIME_FRAME_10` | the frame is not an object |
+| `REALTIME_FRAME_11` | the frame is larger than the limit |
+| `REALTIME_FRAME_12` | unknown frame type |
+| `REALTIME_FRAME_13` | v must be a version |
+| `REALTIME_FRAME_14` | watch must be a boolean |
+| `REALTIME_FRAME_2` | c is not a valid channel name |
+| `REALTIME_FRAME_3` | echo must be a boolean |
+| `REALTIME_FRAME_4` | e is not a valid event name |
+| `REALTIME_FRAME_5` | the frame is not JSON |
+| `REALTIME_FRAME_6` | k is not a valid key |
+| `REALTIME_FRAME_7` | ms must be a positive number |
+| `REALTIME_FRAME_8` | n must be a non-negative integer |
+| `REALTIME_FRAME_9` | sub needs n / req needs n |
+| `REALTIME_LIMIT_1` | limits.history must be at most …. |
+| `REALTIME_LIMIT_2` | unknown limit "…". |
+| `REALTIME_LIMIT_3` | limits.presenceTtlMs must be larger than limits.presenceHeartbeatMs. |
+| `REALTIME_LIMIT_4` | limits.… must be … integer. |
+| `REALTIME_PATTERN_1` | the channel pattern "…" must be 1..128 characters. |
+| `REALTIME_PATTERN_2` | the channel pattern "…" repeats "…". |
+| `REALTIME_PATTERN_3` | the channel pattern "…": {...name} must be the last segment. |
+| `REALTIME_PATTERN_4` | the channel pattern "…" has an invalid segment "…". |
+| `REALTIME_REVOKE` | revoke needs a user, a connection or a channel. |
+| `REALTIME_RULE` | the rule for "…": history must be a non-negative integer. |
+
+A `RealtimeError` raised without a message uses its protocol code (`forbidden`, `too_large`, ...) as the message; those codes are listed in the protocol guide at https://realtime.shadowjs.net/guides/realtime-protocol/. The `REALTIME_FRAME_*` codes are the `why` of a refused client frame, sent with the `bad_frame` error.
+
 ## Learn more
 
 See the ShadowJS documentation at https://shadowjs.net, and the realtime guide at https://realtime.shadowjs.net.

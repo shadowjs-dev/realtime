@@ -38,16 +38,32 @@ export interface TestServer {
   stop(): Promise<void>;
 }
 
-function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const probe = createServer();
-    probe.once("error", reject);
-    probe.listen(0, "127.0.0.1", () => {
-      const address = probe.address();
-      const port = typeof address === "object" && address !== null ? address.port : 0;
-      probe.close(() => resolve(port));
-    });
+/** Ports {@link freePort} already returned in this process (a few hundred at most per run, so the set needs no cap). */
+const handedOut = new Set<number>();
+
+/** Whether a server can listen on `port` on the loopback address right now. */
+function canListen(port: number): Promise<boolean> {
+  return new Promise((resolveFree) => {
+    const server = createServer();
+    server.once("error", () => resolveFree(false));
+    server.listen(port, "127.0.0.1", () => server.close(() => resolveFree(true)));
   });
+}
+
+/** A TCP port that was free a moment ago on 127.0.0.1, picked at random below the ephemeral range. */
+async function freePort(): Promise<number> {
+  // Port 0 hands out the next ephemeral port, the same pool every outbound socket draws from, so a parallel suite
+  // (or a fetch) often takes it between this probe and the server's listen. A random port below the ephemeral
+  // range, never handed out twice by this process, makes that collision rare instead of routine.
+  for (let attempt = 0; attempt < 64; attempt += 1) {
+    const port = 20_000 + Math.floor(Math.random() * 25_000);
+    if (handedOut.has(port)) continue;
+    if (await canListen(port)) {
+      handedOut.add(port);
+      return port;
+    }
+  }
+  throw new Error("freePort: no free port found in 64 attempts between 20000 and 45000");
 }
 
 async function ready(endpoint: Endpoint, child: ChildProcess | undefined): Promise<void> {

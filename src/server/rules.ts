@@ -78,7 +78,11 @@ const LITERAL = /^[A-Za-z0-9_.@/-]+$/;
  */
 export function compileRule(pattern: string, rule: ChannelRule): CompiledRule {
   if (typeof pattern !== "string" || pattern.length === 0 || pattern.length > 128)
-    throw new TypeError(`the channel pattern "${String(pattern)}" must be 1..128 characters.`);
+    throw new TypeError(
+      __DEV__
+        ? `the channel pattern "${String(pattern)}" must be 1..128 characters.`
+        : "REALTIME_PATTERN_1",
+    );
   const segments = pattern.split(":");
   const seen = new Set<string>();
   const parts = segments.map((segment, at): Part => {
@@ -86,11 +90,15 @@ export function compileRule(pattern: string, rule: ChannelRule): CompiledRule {
     if (rest !== null) {
       if (at !== segments.length - 1)
         throw new TypeError(
-          `the channel pattern "${pattern}": {...name} must be the last segment.`,
+          __DEV__
+            ? `the channel pattern "${pattern}": {...name} must be the last segment.`
+            : "REALTIME_PATTERN_3",
         );
       const name = rest[1] as string;
       if (seen.has(name))
-        throw new TypeError(`the channel pattern "${pattern}" repeats "${name}".`);
+        throw new TypeError(
+          __DEV__ ? `the channel pattern "${pattern}" repeats "${name}".` : "REALTIME_PATTERN_2",
+        );
       seen.add(name);
       return { kind: "rest", name };
     }
@@ -98,16 +106,26 @@ export function compileRule(pattern: string, rule: ChannelRule): CompiledRule {
     if (param !== null) {
       const name = param[1] as string;
       if (seen.has(name))
-        throw new TypeError(`the channel pattern "${pattern}" repeats "${name}".`);
+        throw new TypeError(
+          __DEV__ ? `the channel pattern "${pattern}" repeats "${name}".` : "REALTIME_PATTERN_2",
+        );
       seen.add(name);
       return { kind: "param", name };
     }
     if (!LITERAL.test(segment) || segment.startsWith("$"))
-      throw new TypeError(`the channel pattern "${pattern}" has an invalid segment "${segment}".`);
+      throw new TypeError(
+        __DEV__
+          ? `the channel pattern "${pattern}" has an invalid segment "${segment}".`
+          : "REALTIME_PATTERN_4",
+      );
     return { kind: "literal", text: segment };
   });
   if (rule.history !== undefined && (!Number.isInteger(rule.history) || rule.history < 0))
-    throw new RangeError(`the rule for "${pattern}": history must be a non-negative integer.`);
+    throw new RangeError(
+      __DEV__
+        ? `the rule for "${pattern}": history must be a non-negative integer.`
+        : "REALTIME_RULE",
+    );
   return { pattern, parts, rule };
 }
 

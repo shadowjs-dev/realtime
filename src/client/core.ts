@@ -1,13 +1,13 @@
 import { type ErrorCode, RealtimeError } from "../errors";
 import {
   byteLength,
-  decodeServerFrame,
   isChannelName,
   isEventName,
   isIdempotencyKey,
   type Json,
   type Member,
   type ServerFrame,
+  serverFrameOf,
 } from "../protocol";
 import { applyPresence } from "./presence";
 import { type Link, type LinkEvents, openStream } from "./sse";
@@ -64,7 +64,7 @@ interface Chan {
   readonly sl: Set<(status: ChannelStatus) => void>;
   readonly presence: Set<(members: readonly Member[]) => void>;
   readonly members: Map<string, Member>;
-  list: readonly Member[] | undefined;
+  list?: readonly Member[] | undefined;
   status: ChannelStatus;
   /** Listeners registered; the channel subscribes while this is above zero. */
   refs: number;
@@ -75,11 +75,11 @@ interface Chan {
   sy: boolean;
   state: Json | undefined;
   sv: number;
-  w: Wire | undefined;
-  retry: Timer | undefined;
+  w?: Wire | undefined;
+  retry?: Timer | undefined;
   fails: number;
   closed: boolean;
-  hn: Channel<ChannelDef> | undefined;
+  hn?: Channel<ChannelDef> | undefined;
 }
 
 interface Op {
@@ -88,13 +88,13 @@ interface Op {
   readonly event: string;
   /** The JSON text of the data (or of the presence state). */
   readonly data: string;
-  readonly key: string | undefined;
+  readonly key?: string | undefined;
   readonly ack: boolean;
   readonly ms: number;
   readonly order: number;
   n: number;
-  timer: Timer | undefined;
-  settle: ((error: RealtimeError | undefined, value?: unknown) => void) | undefined;
+  timer?: Timer | undefined;
+  settle?: ((error: RealtimeError | undefined, value?: unknown) => void) | undefined;
 }
 
 /**
@@ -129,7 +129,6 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
   const ackTtl = options.ackTimeoutMs ?? 10_000;
   const auto = (options.transport ?? "auto") === "auto";
   const id = clientId();
-  const life = new AbortController();
   const chans = new Map<string, Chan>();
   const dirty = new Set<Chan>();
   const queue: Op[] = [];
@@ -152,13 +151,15 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
   let counter = 0;
   let keys = 0;
   let orders = 0;
-  let received = false;
+  /** Heartbeat intervals since the last thing was received. */
   let silent = 0;
   let connectTimer: Timer | undefined;
   let reconnectTimer: Timer | undefined;
   let stableTimer: Timer | undefined;
   let beatTimer: ReturnType<typeof setInterval> | undefined;
   let posting = false;
+  /** The POST in flight, which closing the client abandons. */
+  let batch: AbortController | undefined;
   let postTimer: Timer | undefined;
   let postFails = 0;
   let listening = false;
@@ -207,15 +208,13 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
     if (settle !== undefined) settle(error, value);
     else if (error !== undefined && op.kind === "pub") report(error);
   };
-  const fail = (op: Op, error: RealtimeError): void => finish(op, error);
-  const succeed = (op: Op, value: unknown): void => finish(op, undefined, value);
   const arm = (op: Op, ms: number): void => {
     clearTimeout(op.timer);
     op.timer = setTimeout(() => {
       const at = queue.indexOf(op);
       if (at >= 0) queue.splice(at, 1);
       if (inflight.get(op.n) === op) inflight.delete(op.n);
-      fail(op, new RealtimeError("timeout"));
+      finish(op, new RealtimeError("timeout"));
     }, ms);
   };
   const take = (n: number): Op | undefined => {
@@ -245,24 +244,17 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
     event: string,
     data: string,
     extra: Partial<Pick<Op, "key" | "ack" | "ms" | "settle">>,
-  ): Op => ({
-    kind,
-    chan,
-    event,
-    data,
-    key: extra.key,
-    ack: extra.ack ?? true,
-    ms: extra.ms ?? 0,
-    order: ++orders,
-    n: 0,
-    timer: undefined,
-    settle: extra.settle,
-  });
+  ): Op => ({ kind, chan, event, data, ack: true, ms: 0, order: ++orders, n: 0, ...extra });
+
+  /** Whether the server answers an operation (a request, or a publish that asks for an acknowledgment). */
+  const answered = (op: Op): boolean => op.kind === "req" || (op.kind === "pub" && op.ack);
+  /** How long an operation that went out waits for its answer: a request's own time and a second, or the acknowledgment time. */
+  const waitOf = (op: Op): number => (op.kind === "req" ? op.ms + 1000 : ackTtl);
 
   /** The frame text of an operation, numbered for an answer. Undefined (and the operation failed) when it is too large. */
   const encode = (op: Op): string | undefined => {
     const c = JSON.stringify(op.chan.name);
-    const wantsAnswer = op.kind === "req" || (op.kind === "pub" && op.ack);
+    const wantsAnswer = answered(op);
     op.n = wantsAnswer ? ++counter : 0;
     const text =
       op.kind === "pres"
@@ -271,7 +263,7 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
           ? `{"t":"req","n":${op.n},"c":${c},"e":"${op.event}","d":${op.data},"ms":${op.ms}}`
           : `{"t":"pub","c":${c},"e":"${op.event}","d":${op.data}${wantsAnswer ? `,"n":${op.n}` : ""},"k":${JSON.stringify(op.key)}}`;
     if (byteLength(text) > maxBytes) {
-      fail(op, new RealtimeError("too_large"));
+      finish(op, new RealtimeError("too_large"));
       return undefined;
     }
     return text;
@@ -280,9 +272,9 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
   /** Records that an operation went out: it now waits for an answer, or is done. */
   const sent = (op: Op): void => {
     if (op.kind === "pres") return;
-    if (op.kind === "req" || op.ack) {
+    if (answered(op)) {
       inflight.set(op.n, op);
-      arm(op, op.kind === "req" ? op.ms + 1000 : ackTtl);
+      arm(op, waitOf(op));
     } else clearTimeout(op.timer);
   };
 
@@ -291,7 +283,7 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
     ops.sort((a, b) => a.order - b.order);
     const again: Op[] = [];
     for (const op of ops) {
-      if (op.kind === "req") fail(op, new RealtimeError("closed"));
+      if (op.kind === "req") finish(op, new RealtimeError("closed"));
       else {
         if (op.kind === "pub") arm(op, queueTtl);
         again.push(op);
@@ -319,7 +311,7 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
   };
 
   /** The fields a subscription goes out with, over a WebSocket as a frame and over SSE as a query entry. */
-  const subscription = (chan: Chan, n: number): { fields: Record<string, unknown> } => {
+  const subscription = (chan: Chan, n: number): Record<string, unknown> => {
     const join = joins(chan);
     const watch = watches(chan);
     const after = chan.sy ? chan.last : chan.options.replay === true ? 0 : undefined;
@@ -327,13 +319,11 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
     chan.w = w;
     setChanStatus(chan, chan.sy ? "resuming" : "subscribing");
     return {
-      fields: {
-        c: chan.name,
-        ...(after === undefined ? {} : { after }),
-        ...(chan.options.echo === false ? { echo: false } : {}),
-        ...(join ? { presence: chan.state } : {}),
-        ...(watch ? { watch: true } : {}),
-      },
+      c: chan.name,
+      ...(after === undefined ? {} : { after }),
+      ...(chan.options.echo === false ? { echo: false } : {}),
+      ...(join ? { presence: chan.state } : {}),
+      ...(watch ? { watch: true } : {}),
     };
   };
 
@@ -363,17 +353,21 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
   };
 
   /** Brings the w in line with what a channel wants (WebSocket: subscribe, unsubscribe, presence). */
+  const unsub = (chan: Chan): void => {
+    link?.send(`{"t":"unsub","c":${JSON.stringify(chan.name)}}`);
+  };
+
   const syncChan = (chan: Chan): void => {
     const want = wants(chan);
     const w = chan.w;
     if (mode === "ws" && ready) {
       if (w !== undefined && (!want || w.join !== joins(chan) || w.watch !== watches(chan))) {
-        link?.send(`{"t":"unsub","c":${JSON.stringify(chan.name)}}`);
+        unsub(chan);
         chan.w = undefined;
       }
       if (want && chan.w === undefined && chan.retry === undefined) {
         const n = ++counter;
-        link?.send(JSON.stringify({ t: "sub", n, ...subscription(chan, n).fields }));
+        link?.send(JSON.stringify({ t: "sub", n, ...subscription(chan, n) }));
       }
     }
     if (!want) {
@@ -394,8 +388,7 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
     if (chan.closed) return;
     chan.closed = true;
     if (chans.get(chan.name) === chan) chans.delete(chan.name);
-    if (chan.w !== undefined && mode === "ws" && ready)
-      link?.send(`{"t":"unsub","c":${JSON.stringify(chan.name)}}`);
+    if (chan.w !== undefined && mode === "ws" && ready) unsub(chan);
     goIdle(chan);
     chan.ev.clear();
     chan.any.clear();
@@ -428,21 +421,6 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
 
   // --- connection ---------------------------------------------------------------------------------------------------
 
-  /** Declares the subscriptions of an SSE stream; returns the query entries. */
-  const declare = (): unknown[] => {
-    const entries: unknown[] = [];
-    for (const chan of [...chans.values()]) {
-      if (!wants(chan)) continue;
-      if (entries.length >= MAX_STREAM_CHANNELS) {
-        closeChan(chan, new RealtimeError("limit"));
-        continue;
-      }
-      entries.push(subscription(chan, entries.length + 1).fields);
-    }
-    streamSig = signature();
-    return entries;
-  };
-
   /** What the open stream must be reopened for: the channels it carries and how they join. */
   const signature = (): string => {
     let sig = "";
@@ -459,11 +437,10 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
     gen += 1;
     const g = gen;
     ready = false;
-    received = false;
     silent = 0;
     const ev: LinkEvents = {
       rx: () => {
-        if (g === gen) received = true;
+        if (g === gen) silent = 0;
       },
       frame: (frame) => {
         if (g === gen) guard(() => onFrame(frame, false));
@@ -476,10 +453,23 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
       if (!listening && typeof addEventListener === "function") {
         listening = true;
         addEventListener("online", onOnline);
+        if (typeof document !== "undefined")
+          document.addEventListener("visibilitychange", onVisible);
       }
       if (mode === "sse") {
         const url = resolveUrl(options.url, false);
-        url.searchParams.set("s", JSON.stringify(declare()));
+        // The subscriptions of the stream go in the query: the entries of the channels it carries.
+        const entries: unknown[] = [];
+        for (const chan of [...chans.values()]) {
+          if (!wants(chan)) continue;
+          if (entries.length >= MAX_STREAM_CHANNELS) {
+            closeChan(chan, new RealtimeError("limit"));
+            continue;
+          }
+          entries.push(subscription(chan, entries.length + 1));
+        }
+        streamSig = signature();
+        url.searchParams.set("s", JSON.stringify(entries));
         link = openStream(url.toString(), doFetch, getHeaders, ev);
       } else
         link = openSocket(
@@ -489,7 +479,7 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
         );
     } catch (error) {
       gen += 1;
-      shutdown(new RealtimeError("closed", "cannot open", { cause: error }));
+      shutdown(new RealtimeError("closed", __DEV__ ? "cannot open" : undefined, { cause: error }));
       return;
     }
     connectTimer = setTimeout(() => {
@@ -499,6 +489,11 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
 
   const onOnline = (): void => {
     if (reconnectTimer !== undefined) connect();
+  };
+
+  /** A tab that was hidden keeps its timers throttled or frozen: when it shows again, a connection waiting out a backoff reconnects now. */
+  const onVisible = (): void => {
+    if (document.visibilityState === "visible" && reconnectTimer !== undefined) connect();
   };
 
   /** Releases the current transport and everything tied to it. */
@@ -538,11 +533,23 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
       info.status < 500 &&
       !RETRYABLE_STATUS.has(info.status);
     if (((code !== undefined && FATAL.has(code)) || refused) && reconnect.retryFatal !== true) {
-      const why =
-        code !== undefined
+      const why = __DEV__
+        ? code !== undefined
           ? `the server closed the connection with ${code}`
-          : `the server answered ${info.status}`;
+          : `the server answered ${info.status}`
+        : undefined;
       shutdown(new RealtimeError("closed", why));
+      return;
+    }
+    if (attempt >= (reconnect.maxReconnectAttempts ?? Infinity)) {
+      shutdown(
+        __DEV__
+          ? new RealtimeError(
+              "closed",
+              `gave up after ${reconnect.maxReconnectAttempts} reconnect attempts`,
+            )
+          : new RealtimeError("closed"),
+      );
       return;
     }
     let delay = backoff(attempt, minDelay, maxDelay, random);
@@ -561,55 +568,34 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
 
   /** Heartbeat: every interval sends a ping; two intervals with nothing received declare the connection dead. */
   const beat = (): void => {
-    if (received) {
-      received = false;
-      silent = 0;
-    } else {
-      silent += 1;
-      if (silent >= 2) {
-        linkClosed({});
-        return;
-      }
+    // The interval that saw the last frame is the first of the three beats counted before the connection is dead.
+    silent += 1;
+    if (silent > 2) {
+      linkClosed({});
+      return;
     }
     if (mode === "ws") link?.send('{"t":"ping"}');
   };
 
-  const reopen = (): void => {
-    drop();
-    for (const chan of chans.values()) chan.w = undefined;
-    connect();
-  };
-
-  const onReady = (frame: Extract<ServerFrame, { t: "ready" }>): void => {
-    if (ready) return;
-    ready = true;
-    connId = frame.id;
-    maxBytes = frame.max;
-    wsFails = 0;
-    received = true;
-    silent = 0;
-    clearTimeout(connectTimer);
-    if (frame.hb > 0) beatTimer = setInterval(beat, frame.hb);
-    stableTimer = setTimeout(() => {
-      attempt = 0;
-    }, stableMs);
-    setStatus("open");
-    if (mode === "ws") for (const chan of chans.values()) dirty.add(chan);
-    flush();
-  };
-
   // --- frames from the server ---------------------------------------------------------------------------------------
-
-  const notifyPresence = (chan: Chan): void => {
-    const members = [...chan.members.values()];
-    chan.list = members;
-    emit(chan.presence, members);
-  };
 
   const onFrame = (frame: ServerFrame, viaPost: boolean): void => {
     switch (frame.t) {
       case "ready":
-        onReady(frame);
+        if (ready) return;
+        ready = true;
+        connId = frame.id;
+        maxBytes = frame.max;
+        wsFails = 0;
+        silent = 0;
+        clearTimeout(connectTimer);
+        if (frame.hb > 0) beatTimer = setInterval(beat, frame.hb);
+        stableTimer = setTimeout(() => {
+          attempt = 0;
+        }, stableMs);
+        setStatus("open");
+        if (mode === "ws") for (const chan of chans.values()) dirty.add(chan);
+        flush();
         return;
       case "bye":
         byeCode = frame.code;
@@ -619,14 +605,14 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
         const w = chan?.w;
         if (chan === undefined || w === undefined || w.n !== frame.n) return;
         if (frame.reset || w.after === undefined) chan.last = frame.head;
-        const info = { after: w.after ?? 0, head: frame.head };
-        const gap = frame.reset
-          ? true
-          : frame.gap === true && w.after !== undefined && !(w.after === 0 && !chan.sy);
+        const gap =
+          frame.reset === true ||
+          (frame.gap === true && w.after !== undefined && !(w.after === 0 && !chan.sy));
         chan.sy = true;
         chan.fails = 0;
         setChanStatus(chan, "live");
-        if (gap) emit(chan.gl, { ...info, reset: frame.reset === true });
+        if (gap)
+          emit(chan.gl, { after: w.after ?? 0, head: frame.head, reset: frame.reset === true });
         return;
       }
       case "unsubbed": {
@@ -635,7 +621,7 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
         if (frame.why === "revoked") {
           // The hub dropped the subscription: closing must not send an unsub it would answer with not_subscribed.
           chan.w = undefined;
-          closeChan(chan, new RealtimeError("forbidden", "revoked"));
+          closeChan(chan, new RealtimeError("forbidden", __DEV__ ? "revoked" : undefined));
         } else resubscribe(chan, frame.why === "gap" || frame.why === "reset");
         return;
       }
@@ -657,12 +643,13 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
       }
       case "ack": {
         const op = take(frame.n);
-        if (op !== undefined) succeed(op, { seq: frame.s, duplicate: frame.dup === true });
+        if (op !== undefined)
+          finish(op, undefined, { seq: frame.s, duplicate: frame.dup === true });
         return;
       }
       case "rep": {
         const op = take(frame.n);
-        if (op !== undefined) succeed(op, frame.d);
+        if (op !== undefined) finish(op, undefined, frame.d);
         return;
       }
       case "err": {
@@ -682,7 +669,7 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
           // Over SSE a number on the stream names a subscription; only a POST answer names an operation.
           const op = viaPost || mode === "ws" ? take(frame.n) : undefined;
           if (op !== undefined) {
-            fail(op, error);
+            finish(op, error);
             return;
           }
         }
@@ -692,7 +679,10 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
       case "pres": {
         const chan = chans.get(frame.c);
         if (chan === undefined) return;
-        if (applyPresence(chan.members, frame.op, frame.m)) notifyPresence(chan);
+        if (applyPresence(chan.members, frame.op, frame.m)) {
+          chan.list = [...chan.members.values()];
+          emit(chan.presence, chan.list);
+        }
         if (frame.op === "sync" && chan.w !== undefined) {
           chan.w.ready = true;
           if (chan.w.join && chan.w.ver !== chan.sv) sendPresence(chan);
@@ -748,6 +738,11 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
   const postBatch = async (ops: Op[], body: string): Promise<void> => {
     for (const op of ops) sent(op);
     let again = false;
+    // A request that never answers would hold `posting` for as long as the platform waits (minutes) and nothing behind it
+    // could be sent: it is abandoned when the longest wait of its operations is over, and its operations are retried.
+    const mine = new AbortController();
+    batch = mine;
+    const patience = setTimeout(() => mine.abort(), Math.max(...ops.map(waitOf)));
     try {
       const headers = new Headers(await getHeaders());
       headers.set("content-type", "application/json");
@@ -755,12 +750,12 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
         options.postUrl === undefined
           ? sendUrl(resolveUrl(options.url, false))
           : resolveUrl(options.postUrl, false);
-      const response = await doFetch(url, { method: "POST", headers, body, signal: life.signal });
+      const response = await doFetch(url, { method: "POST", headers, body, signal: mine.signal });
       if (response.ok) {
         const parsed = (await response.json()) as { frames?: unknown };
         if (Array.isArray(parsed.frames))
           for (const item of parsed.frames as unknown[]) {
-            const frame = decodeServerFrame(JSON.stringify(item));
+            const frame = serverFrameOf(item);
             if (frame !== undefined) guard(() => onFrame(frame, true));
           }
         postFails = 0;
@@ -772,21 +767,21 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
         const code: ErrorCode = refusal?.error?.code ?? "unavailable";
         for (const op of ops) {
           if (inflight.get(op.n) === op) inflight.delete(op.n);
-          fail(op, new RealtimeError(code, refusal?.error?.message));
+          finish(op, new RealtimeError(code, refusal?.error?.message));
         }
       }
     } catch {
-      if (life.signal.aborted) return;
+      if (finished) return;
       again = true;
+    } finally {
+      clearTimeout(patience);
     }
     posting = false;
-    const unanswered = ops.filter(
-      (op) => (op.kind === "req" || (op.kind === "pub" && op.ack)) && inflight.get(op.n) === op,
-    );
+    const unanswered = ops.filter((op) => answered(op) && inflight.get(op.n) === op);
     for (const op of unanswered) inflight.delete(op.n);
     if (again) {
       for (const op of unanswered)
-        if (op.kind === "req") fail(op, new RealtimeError("unavailable"));
+        if (op.kind === "req") finish(op, new RealtimeError("unavailable"));
       requeue(
         ops.filter(
           (op) => op.kind === "pres" || (op.kind === "pub" && (!op.ack || unanswered.includes(op))),
@@ -800,29 +795,30 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
         },
         backoff(postFails - 1, minDelay, maxDelay, random),
       );
-    } else for (const op of unanswered) fail(op, new RealtimeError("unavailable"));
+    } else for (const op of unanswered) finish(op, new RealtimeError("unavailable"));
     flush();
   };
 
   // --- lifecycle ----------------------------------------------------------------------------------------------------
-
-  const needed = (): boolean => queue.length > 0 || [...chans.values()].some(wants);
 
   const run = (): void => {
     scheduled = false;
     if (finished) return;
     syncAll();
     if (link === undefined) {
-      if (reconnectTimer === undefined && needed()) connect();
+      if (reconnectTimer === undefined && (queue.length > 0 || [...chans.values()].some(wants)))
+        connect();
       return;
     }
     if (
       mode === "sse" &&
       (signature() !== streamSig ||
         [...chans.values()].some((c) => wants(c) && c.w === undefined && c.retry === undefined))
-    )
-      reopen();
-    else flush();
+    ) {
+      drop();
+      for (const chan of chans.values()) chan.w = undefined;
+      connect();
+    } else flush();
   };
 
   function schedule(): void {
@@ -839,16 +835,19 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
     reconnectTimer = undefined;
     postTimer = undefined;
     drop();
-    life.abort();
-    if (listening && typeof removeEventListener === "function")
-      removeEventListener("online", onOnline);
-    listening = false;
+    batch?.abort();
+    if (listening) {
+      if (typeof removeEventListener === "function") removeEventListener("online", onOnline);
+      if (typeof document !== "undefined")
+        document.removeEventListener("visibilitychange", onVisible);
+      listening = false;
+    }
     const closed = error ?? new RealtimeError("closed");
     const pending = [...queue.splice(0), ...inflight.values()];
     inflight.clear();
     for (const op of pending) {
       if (op.settle === undefined) clearTimeout(op.timer);
-      else fail(op, closed);
+      else finish(op, closed);
     }
     for (const chan of [...chans.values()]) closeChan(chan);
     chans.clear();
@@ -870,7 +869,6 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
       sl: new Set(),
       presence: new Set(),
       members: new Map(),
-      list: undefined,
       status: "idle",
       refs: 0,
       hd: 0,
@@ -878,11 +876,8 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
       sy: false,
       state: channelOptions.presence,
       sv: 0,
-      w: undefined,
-      retry: undefined,
       fails: 0,
       closed: false,
-      hn: undefined,
     };
     chans.set(name, chan);
     if (wants(chan)) touch(chan);
@@ -895,12 +890,18 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
       after?: () => void,
     ): (() => void) => {
       if (chan.closed) return () => undefined;
+      // A set holds a function once, like `addEventListener`: only the registration that added it counts a hold and may
+      // remove it, so adding the same function twice never leaves a hold that nothing can release.
+      let owns = !set.has(item);
       set.add(item);
-      if (!passive) {
+      if (!passive && owns) {
         chan.refs += 1;
         touch(chan);
       }
       return () => {
+        if (!owns) return;
+        owns = false;
+        // The channel may have been closed (its sets cleared and its holds reset) since this was registered.
         if (!set.delete(item) || passive) return;
         chan.refs -= 1;
         after?.();
@@ -926,7 +927,7 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
         try {
           text = JSON.stringify(data ?? null) ?? "null";
         } catch (cause) {
-          refusal = new RealtimeError("bad_frame", "not JSON", { cause });
+          refusal = new RealtimeError("bad_frame", __DEV__ ? "not JSON" : undefined, { cause });
         }
       if (refusal !== undefined) return Promise.reject(refusal);
       return new Promise<T>((resolve, reject) => {

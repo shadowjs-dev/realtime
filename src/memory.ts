@@ -12,11 +12,17 @@ interface ChannelState {
   seq: number;
   log: StoredMessage[];
   readonly keys: Map<string, { readonly seq: number; readonly expires: number }>;
+  /** The size of `keys` at which expired entries are swept next. */
+  keysSweepAt: number;
   readonly listeners: Set<(message: StoredMessage) => void>;
   readonly pending: StoredMessage[];
   draining: boolean;
   lastActive: number;
 }
+
+/** The most idempotency keys one channel remembers; past it the oldest are forgotten, which only lets a very old resend through. */
+const MAX_KEYS = 65_536;
+const KEYS_SWEEP_FROM = 4096;
 
 interface PresenceEntry {
   member: Member;
@@ -35,6 +41,18 @@ export interface MemoryAdapterOptions {
    * numbering restarts, which a resuming client sees as `reset`. Default: one hour.
    */
   readonly idleMs?: number;
+  /**
+   * Receives a listener's failure (a message or presence listener that threw). Delivery to the other listeners goes on either
+   * way. `createHub` passes its own `onError` here. Default: `console.error`, so a bug in a listener is never silent.
+   */
+  readonly onError?: (error: unknown, context: MemoryErrorContext) => void;
+}
+
+/** Where an error reported by the memory adapter came from. @since 1.0.0 */
+export interface MemoryErrorContext {
+  /** `"listener"` (a message listener) or `"presenceListener"`. */
+  readonly where: "listener" | "presenceListener";
+  readonly channel: string;
 }
 
 /**
@@ -55,6 +73,15 @@ export interface MemoryAdapterOptions {
 export function memoryAdapter(options: MemoryAdapterOptions = {}): Adapter {
   const now = options.now ?? Date.now;
   const idleMs = options.idleMs ?? 3_600_000;
+  const report = (error: unknown, context: MemoryErrorContext): void => {
+    try {
+      if (options.onError === undefined) console.error("[realtime] memory adapter", context, error);
+      else options.onError(error, context);
+    } catch (reporter) {
+      // A reporter that throws must not stop delivery; its failure is the last resort for the console.
+      console.error("[realtime] memory adapter onError", reporter);
+    }
+  };
   let sweepAt = 1024;
   const channels = new Map<string, ChannelState>();
   const presence = new Map<string, Map<string, PresenceEntry>>();
@@ -83,6 +110,7 @@ export function memoryAdapter(options: MemoryAdapterOptions = {}): Adapter {
         seq: 0,
         log: [],
         keys: new Map(),
+        keysSweepAt: KEYS_SWEEP_FROM,
         listeners: new Set(),
         pending: [],
         draining: false,
@@ -93,19 +121,28 @@ export function memoryAdapter(options: MemoryAdapterOptions = {}): Adapter {
     return state;
   }
 
+  /** Calls each listener with `value`. A listener's failure is its own: delivery to the others goes on (guarantee G13). */
+  function deliver<T>(
+    listeners: Iterable<(value: T) => void>,
+    value: T,
+    context: MemoryErrorContext,
+  ): void {
+    for (const listener of [...listeners]) {
+      try {
+        listener(value);
+      } catch (error) {
+        report(error, context);
+      }
+    }
+  }
+
   /** Delivers queued messages in order; a listener that publishes in turn queues behind the message being delivered. */
-  function drain(state: ChannelState): void {
+  function drain(state: ChannelState, channel: string): void {
     if (state.draining) return;
     state.draining = true;
     try {
       for (let next = state.pending.shift(); next !== undefined; next = state.pending.shift()) {
-        for (const listener of [...state.listeners]) {
-          try {
-            listener(next);
-          } catch {
-            // A listener's failure is its own: delivery to the others goes on (guarantee G13).
-          }
-        }
+        deliver(state.listeners, next, { where: "listener", channel });
       }
     } finally {
       state.draining = false;
@@ -118,13 +155,10 @@ export function memoryAdapter(options: MemoryAdapterOptions = {}): Adapter {
     presenceDraining = true;
     try {
       for (let next = presenceQueue.shift(); next !== undefined; next = presenceQueue.shift()) {
-        for (const listener of [...(presenceListeners.get(next.channel) ?? [])]) {
-          try {
-            listener(next);
-          } catch {
-            // See `drain`.
-          }
-        }
+        deliver(presenceListeners.get(next.channel) ?? [], next, {
+          where: "presenceListener",
+          channel: next.channel,
+        });
       }
     } finally {
       presenceDraining = false;
@@ -148,7 +182,7 @@ export function memoryAdapter(options: MemoryAdapterOptions = {}): Adapter {
   }
 
   function check(): void {
-    if (closed) throw new Error("the adapter is closed.");
+    if (closed) throw new Error(__DEV__ ? "the adapter is closed." : "REALTIME_CLOSED");
   }
 
   return {
@@ -163,9 +197,16 @@ export function memoryAdapter(options: MemoryAdapterOptions = {}): Adapter {
       if (publish.key !== undefined) {
         const known = state.keys.get(publish.key);
         if (known !== undefined && known.expires > at) return { seq: known.seq, duplicate: true };
-        // Expired keys are swept when a new one is added, so the map stays bounded by the rate of publishes.
-        if (state.keys.size >= 4096)
-          for (const [key, value] of state.keys) if (value.expires <= at) state.keys.delete(key);
+        // Expired keys are swept each time the map has doubled, so a sweep costs a publish little; the cap holds when none expired.
+        const { keys } = state;
+        if (keys.size >= state.keysSweepAt) {
+          for (const [key, value] of keys) if (value.expires <= at) keys.delete(key);
+          state.keysSweepAt = Math.max(KEYS_SWEEP_FROM, keys.size * 2);
+        }
+        for (const key of keys.keys()) {
+          if (keys.size < MAX_KEYS) break;
+          keys.delete(key);
+        }
       }
       state.seq += 1;
       const message: StoredMessage = { ...entry, seq: state.seq, at };
@@ -181,7 +222,7 @@ export function memoryAdapter(options: MemoryAdapterOptions = {}): Adapter {
         state.log = [];
       }
       state.pending.push(message);
-      drain(state);
+      drain(state, channel);
       return { seq: message.seq, duplicate: false };
     },
 

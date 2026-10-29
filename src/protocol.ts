@@ -100,8 +100,8 @@ export type DecodedClientFrame =
   | { readonly ok: false; readonly code: ErrorCode; readonly n?: number; readonly why: string };
 
 const CHANNEL = /^[A-Za-z0-9_.:/@-]{1,128}$/;
+// Event names and idempotency keys share one shape.
 const EVENT = /^[A-Za-z0-9_.:@-]{1,64}$/;
-const KEY = /^[A-Za-z0-9_.:@-]{1,64}$/;
 const encoder = new TextEncoder();
 
 /**
@@ -136,7 +136,7 @@ export function isEventName(value: unknown): value is string {
 
 /** Whether `value` is a valid idempotency key. @internal */
 export function isIdempotencyKey(value: unknown): value is string {
-  return typeof value === "string" && KEY.test(value);
+  return typeof value === "string" && EVENT.test(value);
 }
 
 /** The number of bytes of `text` in UTF-8, without encoding the common cases. @internal */
@@ -162,9 +162,7 @@ function isCount(value: unknown): value is number {
 type Refusal = Extract<DecodedClientFrame, { ok: false }>;
 
 function bad(why: string, n?: unknown): Refusal {
-  return isCount(n)
-    ? { ok: false, code: "bad_frame", n, why }
-    : { ok: false, code: "bad_frame", why };
+  return { ok: false, code: "bad_frame", why, ...(isCount(n) ? { n } : {}) };
 }
 
 /**
@@ -182,28 +180,37 @@ function bad(why: string, n?: unknown): Refusal {
  */
 export function decodeClientFrame(text: string, maxBytes: number): DecodedClientFrame {
   if (byteLength(text) > maxBytes)
-    return { ok: false, code: "too_large", why: "the frame is larger than the limit" };
+    return {
+      ok: false,
+      code: "too_large",
+      why: __DEV__ ? "the frame is larger than the limit" : "REALTIME_FRAME_11",
+    };
   let value: unknown;
   try {
     value = JSON.parse(text);
   } catch {
-    return bad("the frame is not JSON");
+    return bad(__DEV__ ? "the frame is not JSON" : "REALTIME_FRAME_5");
   }
   if (value === null || typeof value !== "object" || Array.isArray(value))
-    return bad("the frame is not an object");
+    return bad(__DEV__ ? "the frame is not an object" : "REALTIME_FRAME_10");
   const raw = value as Record<string, unknown>;
   const type = raw["t"];
   const n = raw["n"];
-  if (n !== undefined && !isCount(n)) return bad("n must be a non-negative integer");
+  if (n !== undefined && !isCount(n))
+    return bad(__DEV__ ? "n must be a non-negative integer" : "REALTIME_FRAME_8");
   const c = raw["c"];
   const needChannel = (): Refusal | undefined =>
     isChannelName(c)
       ? undefined
-      : { ...bad("c is not a valid channel name", n), code: "bad_channel" };
+      : {
+          ...bad(__DEV__ ? "c is not a valid channel name" : "REALTIME_FRAME_2", n),
+          code: "bad_channel",
+        };
   switch (type) {
     case "hello": {
       const v = raw["v"];
-      if (typeof v !== "number" || !Number.isInteger(v) || v < 1) return bad("v must be a version");
+      if (typeof v !== "number" || !Number.isInteger(v) || v < 1)
+        return bad(__DEV__ ? "v must be a version" : "REALTIME_FRAME_13");
       return { ok: true, frame: { t: "hello", v } };
     }
     case "ping":
@@ -211,15 +218,16 @@ export function decodeClientFrame(text: string, maxBytes: number): DecodedClient
     case "sub": {
       const refusal = needChannel();
       if (refusal !== undefined) return refusal;
-      if (n === undefined) return bad("sub needs n");
+      if (n === undefined) return bad(__DEV__ ? "sub needs n" : "REALTIME_FRAME_9");
       const after = raw["after"];
       if (after !== undefined && !isCount(after))
-        return bad("after must be a non-negative integer", n);
+        return bad(__DEV__ ? "after must be a non-negative integer" : "REALTIME_FRAME_1", n);
       const echo = raw["echo"];
-      if (echo !== undefined && typeof echo !== "boolean") return bad("echo must be a boolean", n);
+      if (echo !== undefined && typeof echo !== "boolean")
+        return bad(__DEV__ ? "echo must be a boolean" : "REALTIME_FRAME_3", n);
       const watch = raw["watch"];
       if (watch !== undefined && typeof watch !== "boolean")
-        return bad("watch must be a boolean", n);
+        return bad(__DEV__ ? "watch must be a boolean" : "REALTIME_FRAME_14", n);
       const hasPresence = "presence" in raw;
       return {
         ok: true,
@@ -247,9 +255,11 @@ export function decodeClientFrame(text: string, maxBytes: number): DecodedClient
       const refusal = needChannel();
       if (refusal !== undefined) return refusal;
       const e = raw["e"];
-      if (!isEventName(e)) return bad("e is not a valid event name", n);
+      if (!isEventName(e))
+        return bad(__DEV__ ? "e is not a valid event name" : "REALTIME_FRAME_4", n);
       const k = raw["k"];
-      if (k !== undefined && !isIdempotencyKey(k)) return bad("k is not a valid key", n);
+      if (k !== undefined && !isIdempotencyKey(k))
+        return bad(__DEV__ ? "k is not a valid key" : "REALTIME_FRAME_6", n);
       const data = JSON.stringify(raw["d"] ?? null);
       return {
         ok: true,
@@ -266,12 +276,13 @@ export function decodeClientFrame(text: string, maxBytes: number): DecodedClient
     case "req": {
       const refusal = needChannel();
       if (refusal !== undefined) return refusal;
-      if (n === undefined) return bad("req needs n");
+      if (n === undefined) return bad(__DEV__ ? "req needs n" : "REALTIME_FRAME_9");
       const e = raw["e"];
-      if (!isEventName(e)) return bad("e is not a valid event name", n);
+      if (!isEventName(e))
+        return bad(__DEV__ ? "e is not a valid event name" : "REALTIME_FRAME_4", n);
       const ms = raw["ms"];
       if (ms !== undefined && !(typeof ms === "number" && Number.isFinite(ms) && ms > 0))
-        return bad("ms must be a positive number", n);
+        return bad(__DEV__ ? "ms must be a positive number" : "REALTIME_FRAME_7", n);
       return {
         ok: true,
         frame: {
@@ -290,7 +301,7 @@ export function decodeClientFrame(text: string, maxBytes: number): DecodedClient
       return { ok: true, frame: { t: "pres", c: c as string, s: (raw["s"] ?? null) as Json } };
     }
     default:
-      return bad("unknown frame type", n);
+      return bad(__DEV__ ? "unknown frame type" : "REALTIME_FRAME_12", n);
   }
 }
 
@@ -354,12 +365,19 @@ export type ServerFrame =
  * @since 1.0.0
  */
 export function decodeServerFrame(text: string): ServerFrame | undefined {
-  let value: unknown;
   try {
-    value = JSON.parse(text);
+    return serverFrameOf(JSON.parse(text));
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Decodes a server frame that is already parsed (the frames of an HTTP answer arrive inside one JSON document), with the
+ * rules of {@link decodeServerFrame}.
+ * @internal
+ */
+export function serverFrameOf(value: unknown): ServerFrame | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
   const str = (key: string): string | undefined => {

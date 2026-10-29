@@ -19,7 +19,10 @@ export interface HubLimits {
   readonly maxQueuedFrames: number;
   /** Bytes the transport may hold unsent before the connection is closed as a slow consumer. Default 1 MiB. */
   readonly maxBufferedBytes: number;
-  /** Publishes per second per connection. Default 20. */
+  /**
+   * Publishes per second per connection. Default 20. It is also the refill rate of the bucket that `sub` and `unsub` frames spend
+   * from (burst: the larger of `publishBurst` and `maxChannelsPerConnection`), so subscription churn is limited like publishing.
+   */
   readonly publishesPerSecond: number;
   /** Largest burst of publishes per connection. Default 40. */
   readonly publishBurst: number;
@@ -75,19 +78,28 @@ export const MAX_HISTORY = 10_000;
 export function resolveLimits(given: Partial<HubLimits> | undefined): HubLimits {
   const out: Record<string, number> = { ...DEFAULT_HUB_LIMITS };
   for (const [name, value] of Object.entries(given ?? {})) {
-    if (!(name in DEFAULT_HUB_LIMITS)) throw new TypeError(`unknown limit "${name}".`);
+    if (!(name in DEFAULT_HUB_LIMITS))
+      throw new TypeError(__DEV__ ? `unknown limit "${name}".` : "REALTIME_LIMIT_2");
     if (value === undefined) continue;
     const floor = name === "history" ? 0 : 1;
     if (typeof value !== "number" || !Number.isInteger(value) || value < floor)
       throw new RangeError(
-        `limits.${name} must be ${floor === 0 ? "a non-negative" : "a positive"} integer.`,
+        __DEV__
+          ? `limits.${name} must be ${floor === 0 ? "a non-negative" : "a positive"} integer.`
+          : "REALTIME_LIMIT_4",
       );
     out[name] = value;
   }
   if ((out["history"] as number) > MAX_HISTORY)
-    throw new RangeError(`limits.history must be at most ${MAX_HISTORY}.`);
+    throw new RangeError(
+      __DEV__ ? `limits.history must be at most ${MAX_HISTORY}.` : "REALTIME_LIMIT_1",
+    );
   if ((out["presenceTtlMs"] as number) <= (out["presenceHeartbeatMs"] as number))
-    throw new RangeError("limits.presenceTtlMs must be larger than limits.presenceHeartbeatMs.");
+    throw new RangeError(
+      __DEV__
+        ? "limits.presenceTtlMs must be larger than limits.presenceHeartbeatMs."
+        : "REALTIME_LIMIT_3",
+    );
   return out as unknown as HubLimits;
 }
 

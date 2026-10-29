@@ -5,7 +5,7 @@ description: "Work with @shadow-js/realtime. Typed channels, presence and resuma
 
 # @shadow-js/realtime
 
-Version 1.0.1. Typed channels, presence and resumable delivery over WebSocket or server-sent events.
+Version 1.0.2. Typed channels, presence and resumable delivery over WebSocket or server-sent events.
 
 ## Where to read more
 
@@ -23,7 +23,7 @@ npm install @shadow-js/realtime
 
 | Package | Range | Required |
 | --- | --- | --- |
-| `@shadow-js/core` | `^1.0.1` | no |
+| `@shadow-js/core` | `^1.0.2` | no |
 
 ## Import paths
 

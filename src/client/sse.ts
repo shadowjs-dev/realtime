@@ -1,3 +1,4 @@
+import { RealtimeError } from "../errors";
 import { decodeServerFrame, type ServerFrame } from "../protocol";
 
 /** What a transport reports to the client. @internal */
@@ -15,36 +16,50 @@ export interface Link {
   close(): void;
 }
 
-/** Splits an event stream into `rt` events; keeps a partial line (and a trailing CR) for the next chunk. @internal */
-export function sseParser(onData: (data: string) => void): (chunk: string) => void {
+/**
+ * Splits an event stream into `rt` events; keeps a partial line (and a trailing CR) for the next chunk.
+ *
+ * What the parser holds is bounded: the unfinished line plus the `data` lines of the event being read may not pass `maxBuffer`
+ * code units (default 1 MiB, far above the largest frame a hub sends with its default limits; the cap is a function so a
+ * hub configured with larger frames can raise it once its `ready` frame has said so). A server that streams an endless line, or endless
+ * `data:` lines with no blank line, would otherwise grow the client's memory without limit; the feed function throws a
+ * `RealtimeError` with code `too_large` instead, and the transport closes and reconnects.
+ * @internal
+ */
+export function sseParser(
+  onData: (data: string) => void,
+  maxBuffer: () => number = () => 1_048_576,
+): (chunk: string) => void {
   let buffer = "";
   let name = "";
-  let data: string[] = [];
+  // The `data` lines of the event being read, joined by newlines; undefined until the event has one.
+  let data: string | undefined;
   return (chunk) => {
-    buffer += chunk;
-    let start = 0;
-    for (let at = 0; at < buffer.length; at += 1) {
-      const char = buffer[at];
-      if (char !== "\n" && char !== "\r") continue;
-      if (char === "\r" && at === buffer.length - 1) break;
-      const line = buffer.slice(start, at);
-      if (char === "\r" && buffer[at + 1] === "\n") at += 1;
-      start = at + 1;
+    // A line ends at LF, CRLF or CR; a CR at the very end waits for the next chunk, which may start with the LF.
+    const lines = (buffer + chunk).split(/\r\n|\n|\r(?!$)/);
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
       if (line === "") {
-        if (name === "rt" && data.length > 0) onData(data.join("\n"));
+        if (name === "rt" && data !== undefined) onData(data);
         name = "";
-        data = [];
+        data = undefined;
         continue;
       }
-      if (line[0] === ":") continue;
-      const colon = line.indexOf(":");
-      const key = colon < 0 ? line : line.slice(0, colon);
-      let value = colon < 0 ? "" : line.slice(colon + 1);
-      if (value[0] === " ") value = value.slice(1);
+      // `field`, `field:value` or `field: value` (one space after the colon is dropped). A comment line has an empty
+      // field name, which matches neither branch. The pattern always matches (every group may be empty), and its `s`
+      // flag keeps U+2028 in a value: only CR and LF end a line.
+      const [, key, value] = /^([^:]*):? ?(.*)/s.exec(line) as unknown as [string, string, string];
       if (key === "event") name = value;
-      else if (key === "data") data.push(value);
+      else if (key === "data") data = data === undefined ? value : `${data}\n${value}`;
     }
-    buffer = buffer.slice(start);
+    if (buffer.length + (data?.length ?? 0) > maxBuffer()) {
+      buffer = "";
+      data = undefined;
+      throw new RealtimeError(
+        "too_large",
+        __DEV__ ? "the event stream sent more than the client buffers" : undefined,
+      );
+    }
   };
 }
 
@@ -66,20 +81,30 @@ export function openStream(
     }
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    const feed = sseParser((data) => {
-      const frame = decodeServerFrame(data);
-      if (frame !== undefined) events.frame(frame);
-    });
+    // A hub may be configured with frames larger than the default cap: its `ready` frame names the largest it sends.
+    let cap = 1_048_576;
+    const feed = sseParser(
+      (data) => {
+        const frame = decodeServerFrame(data);
+        if (frame === undefined) return;
+        if (frame.t === "ready") cap = Math.min(frame.max * 2 + 1_048_576, 16_777_216);
+        events.frame(frame);
+      },
+      () => cap,
+    );
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       events.rx();
+      // An oversized stream throws here, which stops the reading; `end` aborts the request and reports the close.
       feed(decoder.decode(value, { stream: true }));
     }
     events.closed({});
   };
   const end = (): void => {
-    if (!control.signal.aborted) events.closed({});
+    if (control.signal.aborted) return;
+    control.abort();
+    events.closed({});
   };
   run().then(undefined, end);
   return { send: () => false, close: () => control.abort() };

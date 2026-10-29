@@ -238,6 +238,12 @@ export interface RealtimeOptions {
     readonly minDelayMs?: number;
     readonly maxDelayMs?: number;
     readonly stableMs?: number;
+    /**
+     * The most reconnects tried in a row after a connection is lost. The count restarts when a connection stays open
+     * `stableMs`. After the last one fails the client is closed for good: `status` is `"closed"`, pending calls reject
+     * and `onError` receives a `closed` error. Default: unlimited.
+     */
+    readonly maxReconnectAttempts?: number;
     /** Retry after a close the server marked as a violation (1002, 1008, 1009). Default false. */
     readonly retryFatal?: boolean;
     /** The random source for jitter, in [0, 1). Default `Math.random`. */
