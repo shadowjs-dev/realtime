@@ -1,6 +1,6 @@
 {
   "name": "@shadow-js/realtime",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Typed channels, presence and resumable delivery over WebSocket or server-sent events",
   "license": "MIT",
   "type": "module",
@@ -77,16 +77,16 @@
     "url": "https://github.com/shadowjs-dev/realtime/issues"
   },
   "peerDependencies": {
-    "@shadow-js/core": "^1.0.2"
+    "@shadow-js/core": "^1.0.3"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15",
     "@resvg/resvg-wasm": "2.6.2",
-    "@shadow-js/core": "^1.0.2",
-    "@shadow-js/dusk": "^1.0.2",
+    "@shadow-js/core": "^1.0.3",
+    "@shadow-js/dusk": "^1.0.3",
     "@shadow-js/i18n": "*",
     "@shadow-js/router": "*",
-    "@shadow-js/testing": "^1.0.2",
+    "@shadow-js/testing": "^1.0.3",
     "@testing-library/dom": "10.4.2",
     "@types/node": "^24.0.0",
     "esbuild": "0.27.0",

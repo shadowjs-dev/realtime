@@ -71,6 +71,8 @@ interface Chan {
   /** Requests in flight; a stateful connection answers a request only on a subscribed channel. */
   hd: number;
   last: number;
+  /** The head of the last gap reported: the next resume starts there, so a gap with nothing left to replay is not reported again. */
+  gh: number;
   /** True once a `subbed` arrived since the channel last went idle. */
   sy: boolean;
   state: Json | undefined;
@@ -314,7 +316,11 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
   const subscription = (chan: Chan, n: number): Record<string, unknown> => {
     const join = joins(chan);
     const watch = watches(chan);
-    const after = chan.sy ? chan.last : chan.options.replay === true ? 0 : undefined;
+    const after = chan.sy
+      ? Math.max(chan.last, chan.gh)
+      : chan.options.replay === true
+        ? 0
+        : undefined;
     const w: Wire = { n, join, watch, after, ver: chan.sv, ready: !join };
     chan.w = w;
     setChanStatus(chan, chan.sy ? "resuming" : "subscribing");
@@ -611,6 +617,8 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
         chan.sy = true;
         chan.fails = 0;
         setChanStatus(chan, "live");
+        // Read only while the channel is subscribed (see `subscription`), so no reset is needed when it goes idle.
+        chan.gh = gap ? frame.head : 0;
         if (gap)
           emit(chan.gl, { after: w.after ?? 0, head: frame.head, reset: frame.reset === true });
         return;
@@ -873,6 +881,7 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
       refs: 0,
       hd: 0,
       last: 0,
+      gh: 0,
       sy: false,
       state: channelOptions.presence,
       sv: 0,

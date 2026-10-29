@@ -119,7 +119,7 @@ export interface HubCore {
     data: unknown,
     options?: { readonly key?: string },
   ): Promise<PublishResult>;
-  /** Removes matching subscriptions; each subscriber gets `unsubbed why:"revoked"`. Returns how many were removed. */
+  /** Removes matching subscriptions (a subscribe still awaiting its rule is refused); each subscriber gets `unsubbed why:"revoked"`. Returns how many were removed. */
   revoke(target: RevokeTarget): number;
   /** Counters. */
   stats(): HubStats;
@@ -265,6 +265,14 @@ export function createHubCore(options: HubOptions = {}): HubCore {
   const rules: CompiledRule[] = [];
   const conns = new Map<string, ConnState>();
   const chans = new Map<string, ChanState>();
+  /** Subscribes whose rules are being awaited: a revoke issued meanwhile marks them, so the grant cannot outlive it. */
+  const judging = new Set<{
+    readonly conn: ConnState;
+    readonly channel: string;
+    revoked: boolean;
+  }>();
+  /** The tail of each channel's presence joins that are queued or running; an entry leaves when its chain is idle. */
+  const joinChains = new Map<string, Promise<void>>();
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let closing = false;
   let beating = false;
@@ -596,17 +604,21 @@ export function createHubCore(options: HubOptions = {}): HubCore {
         __DEV__ ? "too many channels on this connection" : undefined,
       );
     const found = match(name);
-    if (
-      found === undefined ||
-      !(await allowed(found.rule, "subscribe", name, found.params, conn.identity))
-    )
-      return fail(conn, n, identityDenied(conn), name);
+    if (found === undefined) return fail(conn, n, identityDenied(conn), name);
     const wantsPresence = frame.hasPresence || frame.watch === true;
-    if (
-      wantsPresence &&
-      !(await allowed(found.rule, "presence", name, found.params, conn.identity))
-    )
-      return fail(conn, n, identityDenied(conn), name);
+    const pending = { conn, channel: name, revoked: false };
+    judging.add(pending);
+    try {
+      if (
+        !(await allowed(found.rule, "subscribe", name, found.params, conn.identity)) ||
+        (wantsPresence &&
+          !(await allowed(found.rule, "presence", name, found.params, conn.identity))) ||
+        pending.revoked
+      )
+        return fail(conn, n, identityDenied(conn), name);
+    } finally {
+      judging.delete(pending);
+    }
     if (
       frame.hasPresence &&
       byteLength(JSON.stringify(frame.presence ?? null)) > limits.maxStateBytes
@@ -694,7 +706,20 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     }
   }
 
-  async function joinPresence(sub: SubState, state: Json): Promise<void> {
+  /** Joins one at a time per channel: the capacity check reads the set, so two joins in flight would both see room. */
+  function joinPresence(sub: SubState, state: Json): Promise<void> {
+    const name = sub.channel.name;
+    const run = (joinChains.get(name) ?? Promise.resolve()).then(() => joinOne(sub, state));
+    const settle = (): void => {
+      if (joinChains.get(name) === tail) joinChains.delete(name);
+    };
+    const tail: Promise<void> = run.then(settle, settle);
+    joinChains.set(name, tail);
+    return run;
+  }
+
+  async function joinOne(sub: SubState, state: Json): Promise<void> {
+    if (!sub.active) return;
     const existing = await adapter.presenceList(sub.channel.name);
     if (existing.length >= limits.maxPresenceMembers)
       throw new RealtimeError("limit", __DEV__ ? "the presence set is full" : undefined);
@@ -702,13 +727,18 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     sub.state = state;
     sub.joined = true;
     startHeartbeat();
-    const member: Member = {
+    await adapter.presenceSet(sub.channel.name, memberOf(sub), limits.presenceTtlMs);
+  }
+
+  /** The presence member a joined subscription stands for. */
+  function memberOf(sub: SubState): Member {
+    const { user } = sub.conn.identity;
+    return {
       id: sub.conn.id,
-      ...(sub.conn.identity.user === undefined ? {} : { u: sub.conn.identity.user }),
-      s: state,
-      v: 1,
+      ...(user === undefined ? {} : { u: user }),
+      s: sub.state,
+      v: sub.version,
     };
-    await adapter.presenceSet(sub.channel.name, member, limits.presenceTtlMs);
   }
 
   async function syncPresence(sub: SubState): Promise<void> {
@@ -748,14 +778,8 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     if (!conn.publishBucket.take(now())) return limit(conn, undefined, frame.c);
     sub.version += 1;
     sub.state = frame.s;
-    const member: Member = {
-      id: conn.id,
-      ...(conn.identity.user === undefined ? {} : { u: conn.identity.user }),
-      s: frame.s,
-      v: sub.version,
-    };
     try {
-      await adapter.presenceSet(frame.c, member, limits.presenceTtlMs);
+      await adapter.presenceSet(frame.c, memberOf(sub), limits.presenceTtlMs);
     } catch (error) {
       report(error, { where: "presenceSet", channel: frame.c, connection: conn.id });
       fail(conn, undefined, "unavailable", frame.c);
@@ -796,7 +820,15 @@ export function createHubCore(options: HubOptions = {}): HubCore {
           history: found.rule.history ?? limits.history,
           historyTtlMs: limits.historyTtlMs,
           idempotencyTtlMs: limits.idempotencyTtlMs,
-          ...(frame.k === undefined ? {} : { key: frame.k }),
+          // An idempotency key is only unique per publisher: the adapters hold one key table per channel, so without a
+          // scope a client could mark another user's (or the server's) publish as a duplicate by reusing its key. A
+          // signed-in user keeps the scope across connections; anonymous connections share one. Keys never contain
+          // "/", so `key/scope` cannot be formed two ways.
+          ...(frame.k === undefined
+            ? {}
+            : {
+                key: `${frame.k}/${conn.identity.user === undefined ? "a" : `u:${conn.identity.user}`}`,
+              }),
         },
       );
       counters.published += result.duplicate ? 0 : 1;
@@ -1032,16 +1064,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
       for (const ref of missing) {
         const sub = conns.get(ref.id)?.subs.get(ref.channel);
         if (sub === undefined || !sub.joined) continue;
-        await adapter.presenceSet(
-          ref.channel,
-          {
-            id: ref.id,
-            ...(sub.conn.identity.user === undefined ? {} : { u: sub.conn.identity.user }),
-            s: sub.state,
-            v: sub.version,
-          },
-          limits.presenceTtlMs,
-        );
+        await adapter.presenceSet(ref.channel, memberOf(sub), limits.presenceTtlMs);
       }
       for (const channel of watched) await adapter.presenceReap(channel);
     } catch (error) {
@@ -1177,7 +1200,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
           history: found?.rule.history ?? limits.history,
           historyTtlMs: limits.historyTtlMs,
           idempotencyTtlMs: limits.idempotencyTtlMs,
-          ...(publishOptions.key === undefined ? {} : { key: publishOptions.key }),
+          ...(publishOptions.key === undefined ? {} : { key: `${publishOptions.key}/s` }),
         },
       );
       counters.published += result.duplicate ? 0 : 1;
@@ -1229,12 +1252,19 @@ export function createHubCore(options: HubOptions = {}): HubCore {
         throw new TypeError(
           __DEV__ ? "revoke needs a user, a connection or a channel." : "REALTIME_REVOKE",
         );
+      const hit = (conn: ConnState, channel: string): boolean =>
+        (target.connection === undefined || conn.id === target.connection) &&
+        (target.user === undefined || conn.identity.user === target.user) &&
+        (target.channel === undefined || channel === target.channel);
       let count = 0;
+      for (const item of judging) {
+        if (item.revoked || !hit(item.conn, item.channel)) continue;
+        item.revoked = true;
+        count += 1;
+      }
       for (const conn of [...conns.values()]) {
-        if (target.connection !== undefined && conn.id !== target.connection) continue;
-        if (target.user !== undefined && conn.identity.user !== target.user) continue;
         for (const sub of [...conn.subs.values()]) {
-          if (target.channel !== undefined && sub.channel.name !== target.channel) continue;
+          if (!hit(conn, sub.channel.name)) continue;
           removeSub(sub, "revoked");
           count += 1;
         }
