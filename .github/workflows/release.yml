@@ -1,6 +1,7 @@
 # Publishes @shadow-js/realtime to npm with provenance and creates the GitHub release. It runs on every push to main and
 # publishes only the versions npm does not have yet, so releasing is: change the version, push. A push that changes no version ends after
-# the first job. Needs the NPM_TOKEN secret (an organization secret works). Started by hand it can do a dry run.
+# the first job, unless the release of the current version is missing (an earlier run stopped before making it), which it then makes.
+# Needs the NPM_TOKEN secret (an organization secret works); only the steps that publish get it. Started by hand it can do a dry run.
 name: release
 
 on:
@@ -18,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release
+  group: release-${{ inputs.dry_run && 'dry-run' || 'publish' }}
   cancel-in-progress: false
 
 jobs:
@@ -29,6 +30,7 @@ jobs:
     outputs:
       pending: ${{ steps.plan.outputs.pending }}
       version: ${{ steps.plan.outputs.version }}
+      released: ${{ steps.released.outputs.released }}
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -44,6 +46,24 @@ jobs:
         id: plan
         run: node scripts/release.mjs plan
 
+      # The release is looked up here, not only after a publish, so that a version whose release failed to be made is repaired by the next run.
+      - name: Is there a GitHub release for this version
+        id: released
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          if answer=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/v$VERSION" --jq .html_url 2>&1); then
+            echo "v$VERSION has a release: $answer"
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          elif printf '%s' "$answer" | grep -q "HTTP 404"; then
+            echo "v$VERSION has no release yet"
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Could not ask GitHub whether v$VERSION has a release: $answer"
+            exit 1
+          fi
+
       # Fail here, before the long jobs, when the secret was not added.
       - name: Check that the npm token is set
         if: ${{ steps.plan.outputs.pending == 'true' && !inputs.dry_run }}
@@ -58,31 +78,33 @@ jobs:
   publish:
     name: publish
     needs: plan
-    if: ${{ needs.plan.outputs.pending == 'true' }}
+    if: ${{ needs.plan.outputs.pending == 'true' && (inputs.dry_run || github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
     # Includes the wait for the packages of the other repositories, which are published by their own runs.
     timeout-minutes: 240
+    # No write access to the repository: the release is made by the last job. The id-token is what the provenance is signed with.
     permissions:
-      contents: write
+      contents: read
       id-token: write
-    # The token is set for every step: npm sends it with the reads of the install too, and a placeholder token is refused by the registry.
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      # Set up without the registry-url option: it writes a config with a placeholder token that the install would send to the registry,
+      # which refuses it.
+      # The packages the install reads are public; the token is given to the publish steps only.
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
-          registry-url: https://registry.npmjs.org
 
       # Fail first, before the long steps, when the secret was not added.
       - name: Check that the npm token is set
         if: ${{ !inputs.dry_run }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           if [ -z "$NODE_AUTH_TOKEN" ]; then
             echo "::error::The NPM_TOKEN secret is empty. Add an npm automation token as the NPM_TOKEN secret of this repository (or of the organization), then run this workflow again."
@@ -109,12 +131,29 @@ jobs:
 
       - name: Publish
         if: ${{ !inputs.dry_run }}
-        run: node scripts/release.mjs publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          printf '%s\n' '//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}' > "$RUNNER_TEMP/publish.npmrc"
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/publish.npmrc" node scripts/release.mjs publish
+
+  release:
+    name: tag and release
+    needs: [plan, publish]
+    # Not when the run was canceled, a dry run, or off main. After a publish, or when everything was published by an earlier run and the
+    # release of this version is missing (the earlier run stopped between the two). The tag then points at this commit.
+    if: ${{ !cancelled() && !inputs.dry_run && github.ref == 'refs/heads/main' && needs.plan.result == 'success' && needs.plan.outputs.version != '' && needs.plan.outputs.released != 'true' && (needs.publish.result == 'success' || (needs.publish.result == 'skipped' && needs.plan.outputs.pending != 'true')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Tag and create the release
-        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.plan.outputs.version }}
@@ -124,5 +163,14 @@ jobs:
             exit 0
           fi
           notes=$(mktemp)
-          awk -v v="$VERSION" '$0 ~ "^## " v "$" {on=1; next} /^## / {on=0} on' CHANGELOG.md > "$notes"
-          gh release create "v$VERSION" --target "$GITHUB_SHA" --title "$VERSION" --notes-file "$notes"
+          awk -v v="$VERSION" '$0 == "## " v {on=1; next} /^## / {on=0} on' CHANGELOG.md > "$notes"
+          if [ ! -s "$notes" ]; then
+            echo "::warning::CHANGELOG.md has no \"## $VERSION\" section, so the release has no notes."
+          fi
+          # A prerelease is marked as one (the part after a plus sign is build metadata, whose hyphens do not count).
+          prerelease=""
+          case "${VERSION%%+*}" in
+            *-*) prerelease="--prerelease" ;;
+            *) ;;
+          esac
+          gh release create "v$VERSION" --target "$GITHUB_SHA" --title "$VERSION" --notes-file "$notes" $prerelease

@@ -8,11 +8,13 @@
 //   node scripts/release.mjs publish [--registry <url>] [--dry-run]           publishes the missing packages, in dependency order
 //
 // `plan` writes `pending=true|false` and `version=<x.y.z>` to $GITHUB_OUTPUT when it is set. Set RELEASE_PROVENANCE=false to publish without
-// provenance (a registry on this machine has no provider to attest the build). No dependencies: it runs before `npm install`.
+// provenance (a registry on this machine has no provider to attest the build). A prerelease is published under the tag `next`, and a
+// version below the registry's `latest` under `release-<major>`, so neither takes `latest` from the newest release. No dependencies: it
+// runs before `npm install`.
 import { spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const DEFAULT_REGISTRY = "https://registry.npmjs.org";
 /** Scopes whose packages are published by the other repositories of the project. */
@@ -71,35 +73,154 @@ export function inDependencyOrder(packages) {
   return ordered;
 }
 
+const SEMVER =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+/**
+ * Reads a semantic version (semver.org, section 2).
+ * @param {unknown} version The text.
+ * @returns {{ core: number[], pre: string[] | undefined } | undefined} Its parts, or undefined when it is not one. Build metadata is dropped.
+ */
+export function parseVersion(version) {
+  const match = typeof version === "string" ? SEMVER.exec(version) : null;
+  if (match === null) return undefined;
+  return {
+    core: [Number(match[1]), Number(match[2]), Number(match[3])],
+    pre: match[4]?.split("."),
+  };
+}
+
+/**
+ * Orders two semantic versions by precedence (semver.org, section 11), not as text: `1.10.0` is after `1.9.0`, and `1.0.0-rc.1` is before `1.0.0`.
+ * @param {string} a A version.
+ * @param {string} b Another version.
+ * @returns {-1 | 0 | 1} Negative when `a` comes first.
+ * @throws {Error} When either is not a semantic version.
+ */
+export function compareVersions(a, b) {
+  const x = parseVersion(a);
+  const y = parseVersion(b);
+  if (x === undefined || y === undefined)
+    throw new Error(`"${x === undefined ? a : b}" is not a semantic version`);
+  for (let index = 0; index < 3; index += 1) {
+    if (x.core[index] !== y.core[index]) return x.core[index] < y.core[index] ? -1 : 1;
+  }
+  if (x.pre === undefined || y.pre === undefined) {
+    if (x.pre === y.pre) return 0;
+    return x.pre === undefined ? 1 : -1;
+  }
+  for (let index = 0; index < Math.min(x.pre.length, y.pre.length); index += 1) {
+    const left = x.pre[index];
+    const right = y.pre[index];
+    if (left === right) continue;
+    const leftNumeric = /^\d+$/.test(left);
+    const rightNumeric = /^\d+$/.test(right);
+    if (leftNumeric && rightNumeric) return Number(left) < Number(right) ? -1 : 1;
+    // A numeric identifier is lower than an alphanumeric one.
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    return left < right ? -1 : 1;
+  }
+  if (x.pre.length === y.pre.length) return 0;
+  return x.pre.length < y.pre.length ? -1 : 1;
+}
+
+/**
+ * The dist-tag a version must be published under, if not `latest`. A prerelease must not become `latest` (the first install would get it),
+ * and neither must a version lower than the current `latest` (a fix for an older line, or a version published late): npm moves `latest` to
+ * whatever was published last unless told otherwise.
+ * @param {string} version The version about to be published.
+ * @param {string | undefined} latest The registry's current `latest`, when it has one.
+ * @returns {string | undefined} The tag, or undefined for the default one.
+ * @throws {Error} When `version` is not a semantic version.
+ */
+export function distTagFor(version, latest) {
+  const parsed = parseVersion(version);
+  if (parsed === undefined) throw new Error(`"${version}" is not a semantic version`);
+  if (parsed.pre !== undefined) return "next";
+  // A `latest` that is a prerelease or not a version at all is no reason to hold a stable version back.
+  const current = parseVersion(latest);
+  if (current !== undefined && current.pre === undefined && compareVersions(version, latest) < 0)
+    return `release-${parsed.core[0]}`;
+  return undefined;
+}
+
+const defaultSleep = (ms) => new Promise((done) => setTimeout(done, ms));
+
+/**
+ * @typedef {object} RegistryOptions
+ * @property {(ms: number) => Promise<void>} [sleep] Waits between attempts (replaced in tests).
+ * @property {number} [attempts] How many times to ask before giving up on a 5xx, a 429 or a connection failure.
+ * @property {number} [delayMs] The wait before the second attempt; it doubles.
+ */
+
+/**
+ * The registry's document of a package. A 5xx answer, a 429 and a failed connection are asked again a few times (the registry has
+ * short outages, and one must not stop a release); a 404 is "no such package"; any other answer is an error.
+ * @param {string} registry The registry URL.
+ * @param {string} name The package name.
+ * @param {RegistryOptions} [options] Replaced in tests.
+ * @returns {Promise<{ versions?: Record<string, unknown>, "dist-tags"?: Record<string, string> } | undefined>} The document, or undefined for a package the registry does not have.
+ * @throws {Error} When the registry cannot be asked.
+ */
+export async function registryDocument(registry, name, options = {}) {
+  const { sleep = defaultSleep, attempts = 4, delayMs = 1000 } = options;
+  let delay = delayMs;
+  for (let attempt = 1; ; attempt += 1) {
+    let response;
+    try {
+      response = await fetch(`${registry}/${name.replace("/", "%2f")}`, {
+        headers: { accept: "application/vnd.npm.install-v1+json" },
+        // A registry that accepts the connection and never answers must not hold the job until its time limit.
+        signal: AbortSignal.timeout(30_000),
+      });
+    } catch (error) {
+      if (attempt >= attempts)
+        throw new Error(
+          `${registry} could not be reached for ${name}: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
+      console.log(
+        `${registry} could not be reached for ${name} (${error instanceof Error ? error.message : String(error)}); asking again`,
+      );
+    }
+    if (response !== undefined) {
+      if (response.status === 404) return undefined;
+      if (response.ok) return response.json();
+      const transient = response.status >= 500 || response.status === 429;
+      if (!transient || attempt >= attempts)
+        throw new Error(`${registry} answered ${response.status} for ${name}`);
+    }
+    await sleep(delay);
+    delay = Math.min(delay * 2, 30_000);
+  }
+}
+
 /**
  * Whether a version is on the registry. A missing package is "no"; anything else that goes wrong is an error, never a "no": a network
  * failure must not look like an unpublished package, or the run would try to publish a version that exists.
  * @param {string} registry The registry URL.
  * @param {string} name The package name.
  * @param {string} version The version.
+ * @param {RegistryOptions} [options] Replaced in tests.
  * @returns {Promise<boolean>} True when that version is published.
  * @throws {Error} When the registry cannot be asked.
  */
-export async function isPublished(registry, name, version) {
-  const response = await fetch(`${registry}/${name.replace("/", "%2f")}`, {
-    headers: { accept: "application/vnd.npm.install-v1+json" },
-  });
-  if (response.status === 404) return false;
-  if (!response.ok) throw new Error(`${registry} answered ${response.status} for ${name}`);
-  const document = await response.json();
-  return Object.hasOwn(document.versions ?? {}, version);
+export async function isPublished(registry, name, version, options = {}) {
+  const document = await registryDocument(registry, name, options);
+  return document !== undefined && Object.hasOwn(document.versions ?? {}, version);
 }
 
 /**
  * The packages of the repository whose version the registry does not have.
  * @param {string} root The repository folder.
  * @param {string} registry The registry URL.
+ * @param {RegistryOptions} [options] Replaced in tests.
  * @returns {Promise<ReturnType<typeof readPackages>>} In publication order.
  */
-export async function missingPackages(root, registry) {
+export async function missingPackages(root, registry, options = {}) {
   const missing = [];
   for (const entry of inDependencyOrder(readPackages(root))) {
-    if (!(await isPublished(registry, entry.name, entry.version))) missing.push(entry);
+    if (!(await isPublished(registry, entry.name, entry.version, options))) missing.push(entry);
   }
   return missing;
 }
@@ -113,7 +234,9 @@ export async function missingPackages(root, registry) {
  */
 export function problemsOf(packages, repository) {
   const problems = [];
-  for (const { name, manifest } of packages) {
+  for (const { name, version, manifest } of packages) {
+    if (parseVersion(version) === undefined)
+      problems.push(`${name}: version ${JSON.stringify(version)} is not a semantic version`);
     const url =
       typeof manifest.repository === "object" ? manifest.repository?.url : manifest.repository;
     if (typeof url !== "string") problems.push(`${name}: package.json has no repository.url`);
@@ -190,9 +313,13 @@ function npm(args, options = {}) {
  * @returns {{ found: boolean, detail: string }} Whether it exists, and what npm said when it does not.
  */
 function satisfied(registry, name, range) {
-  const view = npm(["view", `${name}@${range}`, "version", "--registry", registry]);
+  // A timeout: npm waits for a registry that accepted the connection and never answers, and the job would sit there until its time limit.
+  const view = npm(["view", `${name}@${range}`, "version", "--registry", registry], {
+    timeout: 120_000,
+  });
   if (view.status === 0 && view.stdout.trim() !== "") return { found: true, detail: "" };
-  return { found: false, detail: (view.stderr || view.stdout).trim().split("\n")[0] ?? "" };
+  const said = (view.stderr || view.stdout || view.error?.message || "").trim();
+  return { found: false, detail: said.split("\n")[0] ?? "" };
 }
 
 /**
@@ -230,7 +357,14 @@ export async function waitForDependencies(root, registry, timeoutMinutes, sleep 
   );
 }
 
-const defaultSleep = (ms) => new Promise((done) => setTimeout(done, ms));
+/** What npm says when the version is already held (published, or staged and not listed yet). */
+const ALREADY_PUBLISHED = /cannot publish over (?:the )?previously (?:published|staged)/i;
+/**
+ * What npm says for a failure that another attempt can cure: a conflict while the registry still processes the package (E409), a
+ * rate limit (E429), a server error (E5xx) or a broken connection. Anything else (E401, E403, E404, a bad manifest) fails at once.
+ */
+const TRANSIENT_FAILURE =
+  /\bE(?:409|429|5\d\d)\b|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|socket hang up/i;
 
 /**
  * Publishes the packages the registry does not have, then checks that each one is there.
@@ -241,16 +375,17 @@ const defaultSleep = (ms) => new Promise((done) => setTimeout(done, ms));
  * @param {(ms: number) => Promise<void>} [options.sleep] Waits between polls (replaced in tests).
  * @param {(name: string, version: string) => Promise<boolean>} [options.listed] Whether the registry lists a version (replaced in tests).
  * @param {number} [options.listingMinutes] How long to wait for a published version to be listed.
+ * @param {number} [options.publishAttempts] How many times `npm publish` is run for one package when it fails in a way another attempt can cure.
  * @returns {Promise<string[]>} `name@version` of what was published (or would be).
  * @throws {Error} When a publish fails or the version does not appear on the registry afterward.
  */
 export async function publishMissing(
   root,
   registry,
-  { dryRun, sleep = defaultSleep, listed = undefined, listingMinutes = 20 },
+  { dryRun, sleep = defaultSleep, listed = undefined, listingMinutes = 20, publishAttempts = 3 },
 ) {
-  const isListed = listed ?? ((name, version) => isPublished(registry, name, version));
-  const missing = await missingPackages(root, registry);
+  const isListed = listed ?? ((name, version) => isPublished(registry, name, version, { sleep }));
+  const missing = await missingPackages(root, registry, { sleep });
   const problems = problemsOf(missing, process.env.GITHUB_REPOSITORY);
   if (problems.length > 0) throw new Error(problems.join("\n"));
   const onNpm = new URL(registry).hostname === "registry.npmjs.org";
@@ -260,24 +395,50 @@ export async function publishMissing(
     );
   const published = [];
   for (const { name, version, dir } of missing) {
-    // A prerelease must not become `latest`: the first install of the package would get it.
-    const tag = version.includes("-") ? ["--tag", "next"] : [];
-    const args = ["publish", dir, "--access", "public", ...tag, "--registry", registry];
+    // npm moves `latest` to whatever it was given last, so a prerelease, or a version below the current `latest`, gets another tag.
+    const latest = (await registryDocument(registry, name, { sleep }))?.["dist-tags"]?.latest;
+    const distTag = distTagFor(version, latest);
+    const args = [
+      "publish",
+      dir,
+      "--access",
+      "public",
+      ...(distTag === undefined ? [] : ["--tag", distTag]),
+      "--registry",
+      registry,
+    ];
     if (process.env.RELEASE_PROVENANCE === "false") args.push("--provenance=false");
     else args.push("--provenance");
     if (dryRun) args.push("--dry-run");
-    console.log(`${dryRun ? "would publish" : "publishing"} ${name}@${version}`);
-    const result = npm(args, { stdio: ["inherit", "inherit", "pipe"] });
-    process.stderr.write(result.stderr ?? "");
-    // The first version of a package is staged and listed minutes later, so a run that publishes it, or a run that starts again after
-    // one that failed, can be told the version is there although the registry does not list it yet: that is a publish already done.
-    const already = /cannot publish over (?:the )?previously (?:published|staged)/i.test(
-      result.stderr ?? "",
+    console.log(
+      `${dryRun ? "would publish" : "publishing"} ${name}@${version}${distTag === undefined ? "" : ` under the tag ${distTag} (latest is ${latest ?? "none"})`}`,
     );
-    if (result.status !== 0 && !already)
-      throw new Error(`npm publish failed for ${name}@${version}`);
-    if (already)
-      console.log(`${name}@${version} is already published; waiting for the registry to list it`);
+    let delay = 5_000;
+    for (let attempt = 1; ; attempt += 1) {
+      const result = npm(args, { stdio: ["inherit", "inherit", "pipe"] });
+      const said = result.stderr ?? "";
+      process.stderr.write(said);
+      if (result.status === 0) break;
+      // The first version of a package is staged and listed minutes later, so a run that publishes it, or a run that starts again after
+      // one that failed, can be told the version is there although the registry does not list it yet: that is a publish already done.
+      if (ALREADY_PUBLISHED.test(said)) {
+        console.log(`${name}@${version} is already published; waiting for the registry to list it`);
+        break;
+      }
+      if (attempt >= publishAttempts || !TRANSIENT_FAILURE.test(said))
+        throw new Error(`npm publish failed for ${name}@${version}`);
+      // A lost answer or a 5xx can come after the registry stored the version: look before publishing again.
+      const stored = await isListed(name, version).catch((error) => {
+        console.log(`could not ask whether ${name}@${version} is listed: ${error.message}`);
+        return false;
+      });
+      if (stored) break;
+      console.log(
+        `npm publish failed for ${name}@${version} (attempt ${attempt} of ${publishAttempts}); trying again in ${delay / 1000} s`,
+      );
+      await sleep(delay);
+      delay *= 2;
+    }
     published.push(`${name}@${version}`);
     if (dryRun) continue;
     // npm can take several minutes to list the first version of a package it has not seen before (it scans it first); the next package of
@@ -341,11 +502,25 @@ export async function installWithRetry(root, extra, options = {}) {
  * What a push would publish.
  * @param {string} root The repository folder.
  * @param {string} registry The registry URL.
+ * @param {RegistryOptions} [options] Replaced in tests.
  * @returns {Promise<{ lines: string[], pending: boolean, version: string }>} One line per package, whether any is missing, and the version of the first package.
+ * @throws {Error} When a package has no semantic version: the version is written to the workflow's outputs and becomes a tag name.
  */
-export async function plan(root, registry) {
-  const missing = new Set((await missingPackages(root, registry)).map((entry) => entry.name));
+export async function plan(root, registry, options = {}) {
   const all = readPackages(root);
+  const invalid = all.filter((entry) => parseVersion(entry.version) === undefined);
+  if (invalid.length > 0)
+    throw new Error(
+      invalid
+        .map(
+          (entry) =>
+            `${entry.name}: version ${JSON.stringify(entry.version)} is not a semantic version`,
+        )
+        .join("\n"),
+    );
+  const missing = new Set(
+    (await missingPackages(root, registry, options)).map((entry) => entry.name),
+  );
   return {
     lines: all.map(
       (entry) =>
@@ -398,7 +573,33 @@ export async function main(argv, root) {
   }
 }
 
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+/**
+ * Whether this file is the script node was started with. The paths are compared after resolving links: a script started through a
+ * symbolic link (or a path that names it another way) has an `import.meta.url` that is the real file and an `argv[1]` that is not, and
+ * comparing those as text would end the run without doing anything and without an error, which for a release looks like "nothing to
+ * publish". It stands here and not in a shared module because a public repository has only this file.
+ * @param {string} moduleUrl This module's `import.meta.url`.
+ * @param {string | undefined} entry The script path node was given (`process.argv[1]`).
+ * @param {(file: string) => string} [realpath] Resolves links (replaced in tests).
+ * @returns {boolean} True when `moduleUrl` is the entry script.
+ */
+export function isEntryScript(moduleUrl, entry = process.argv[1], realpath = realpathSync.native) {
+  if (entry === undefined) return false;
+  const real = (file) => {
+    try {
+      return realpath(file);
+    } catch (error) {
+      // A path that does not exist (`node -`, a script removed after it started) cannot be this file.
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT")
+        return undefined;
+      throw error;
+    }
+  };
+  const own = real(fileURLToPath(moduleUrl));
+  return own !== undefined && own === real(entry);
+}
+
+if (isEntryScript(import.meta.url)) {
   main(process.argv.slice(2), resolve(process.cwd())).catch((error) => {
     console.error(`✖ ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;

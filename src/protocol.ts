@@ -134,29 +134,20 @@ export function isEventName(value: unknown): value is string {
   return typeof value === "string" && EVENT.test(value);
 }
 
-/** Whether `value` is a valid idempotency key. @internal */
-export function isIdempotencyKey(value: unknown): value is string {
-  return typeof value === "string" && EVENT.test(value);
-}
+/** Whether `value` is a valid idempotency key (the shape of an event name). @internal */
+export const isIdempotencyKey: (value: unknown) => value is string = isEventName;
 
-/** The number of bytes of `text` in UTF-8, without encoding the common cases. @internal */
+/** The number of bytes of `text` in UTF-8, without encoding the common (all ASCII) case. @internal */
 export function byteLength(text: string): number {
-  // Every UTF-16 unit is at most 3 bytes in UTF-8, and at least 1.
-  if (text.length * 3 <= 0x7fffffff) {
-    let ascii = true;
-    for (let at = 0; at < text.length; at += 1) {
-      if (text.charCodeAt(at) > 0x7f) {
-        ascii = false;
-        break;
-      }
-    }
-    if (ascii) return text.length;
+  for (let at = 0; at < text.length; at += 1) {
+    if (text.charCodeAt(at) > 0x7f) return encoder.encode(text).length;
   }
-  return encoder.encode(text).length;
+  return text.length;
 }
 
 function isCount(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+  // `isSafeInteger` is false for anything that is not a number.
+  return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
 type Refusal = Extract<DecodedClientFrame, { ok: false }>;

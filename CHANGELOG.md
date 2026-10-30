@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.4
+
+### Fixed
+
+- Smaller bundles with the same behavior.
+- Smaller bundles with the same behavior.
+
 ## 1.0.3
 
 ### Fixed

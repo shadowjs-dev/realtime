@@ -159,20 +159,20 @@ interface SubState {
   readonly params: Record<string, string>;
   readonly echo: boolean;
   readonly watch: boolean;
-  joined: boolean;
+  joined?: boolean;
   version: number;
   /** The state this connection last published to the presence set, to write it back if the entry expired. */
   state: Json;
-  lastSeq: number;
+  seq: number;
   /** The `at` of the last message delivered: a message with an old seq but a newer `at` means the numbering restarted. */
-  lastAt: number;
+  at: number;
   /** While true, live messages wait in `buffer` and `pump` delivers in order. */
   pumping: boolean;
-  gapOk: boolean;
+  gapOk?: boolean;
   buffer: StoredMessage[];
-  presenceQueue: PresenceEvent[] | undefined;
+  queued: PresenceEvent[] | undefined;
   /** The join in progress, so that releasing the subscription waits for it and never leaves a member behind. */
-  joining: Promise<void> | undefined;
+  joining?: Promise<void> | undefined;
   active: boolean;
 }
 
@@ -180,11 +180,11 @@ interface ChanState {
   readonly name: string;
   readonly subs: Set<SubState>;
   readonly bucket: TokenBucket;
-  adapterSub: Promise<Unsubscribe> | undefined;
-  presenceSub: Promise<Unsubscribe> | undefined;
-  closing: boolean;
+  feed?: Promise<Unsubscribe> | undefined;
+  pfeed?: Promise<Unsubscribe> | undefined;
+  closing?: boolean;
   /** Cache of the encoded frame of the message being fanned out. */
-  frame: { readonly seq: number; readonly text: string } | undefined;
+  frame?: { readonly seq: number; readonly text: string } | undefined;
 }
 
 interface ConnState {
@@ -195,14 +195,14 @@ interface ConnState {
   readonly queue: string[];
   readonly publishBucket: TokenBucket;
   /** Spent by `sub` and `unsub` frames: subscription churn costs the adapter (and Redis) work like a publish does. */
-  readonly controlBucket: TokenBucket;
+  readonly ctl: TokenBucket;
   readonly invalid: WindowCounter;
   readonly limited: WindowCounter;
   readonly pending: Set<AbortController>;
   readonly stateless: boolean;
   readonly waiters: (() => void)[];
-  running: boolean;
-  closed: boolean;
+  running?: boolean;
+  closed?: boolean;
   release: (() => void) | undefined;
   readonly done: Promise<void>;
 }
@@ -265,12 +265,8 @@ export function createHubCore(options: HubOptions = {}): HubCore {
   const rules: CompiledRule[] = [];
   const conns = new Map<string, ConnState>();
   const chans = new Map<string, ChanState>();
-  /** Subscribes whose rules are being awaited: a revoke issued meanwhile marks them, so the grant cannot outlive it. */
-  const judging = new Set<{
-    readonly conn: ConnState;
-    readonly channel: string;
-    revoked: boolean;
-  }>();
+  /** Subscribes whose rules are being awaited: a revoke issued meanwhile takes them out, so the grant cannot outlive it. */
+  const judging = new Set<{ readonly conn: ConnState; readonly channel: string }>();
   /** The tail of each channel's presence joins that are queued or running; an entry leaves when its chain is idle. */
   const joinChains = new Map<string, Promise<void>>();
   let heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -316,7 +312,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
       report(error, { where: `rule.${op}`, channel });
       throw new RealtimeError(
         "unavailable",
-        __DEV__ ? "the channel rule could not be evaluated" : undefined,
+        ...(__DEV__ ? ["the channel rule could not be evaluated"] : []),
       );
     }
   }
@@ -355,6 +351,8 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     send(conn, encodeFrame(frame));
   }
 
+  // Development texts are passed as `...(__DEV__ ? ["text"] : [])`: production passes no argument at all, where
+  // `__DEV__ ? "text" : undefined` would leave an `undefined` argument in every call.
   function fail(
     conn: ConnState,
     n: number | undefined,
@@ -396,10 +394,6 @@ export function createHubCore(options: HubOptions = {}): HubCore {
           limits.channelPublishesPerSecond,
           now(),
         ),
-        adapterSub: undefined,
-        presenceSub: undefined,
-        closing: false,
-        frame: undefined,
       };
       chans.set(name, chan);
     }
@@ -409,7 +403,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
   /** Opens one of the channel's two adapter feeds once; a failed attempt is forgotten so the next caller retries. */
   async function ensureFeed(
     chan: ChanState,
-    key: "adapterSub" | "presenceSub",
+    key: "feed" | "pfeed",
     open: () => Promise<Unsubscribe>,
   ): Promise<void> {
     if (chan[key] === undefined) {
@@ -431,36 +425,35 @@ export function createHubCore(options: HubOptions = {}): HubCore {
         else sub.buffer.push(message);
         continue;
       }
-      if (message.seq === sub.lastSeq + 1) deliver(sub, message, false);
-      else if (message.seq > sub.lastSeq + 1) {
+      if (message.seq === sub.seq + 1) deliver(sub, message, false);
+      else if (message.seq > sub.seq + 1) {
         sub.buffer.push(message);
         void pump(sub, undefined);
-      } else if (message.at > sub.lastAt) removeSub(sub, "reset");
+      } else if (message.at > sub.at) removeSub(sub, "reset");
       // Any other seq at or below the cursor was already delivered: dropped (guarantee G2).
     }
   }
 
   function deliver(sub: SubState, message: StoredMessage, replayed: boolean): void {
-    sub.lastSeq = message.seq;
-    sub.lastAt = Math.max(sub.lastAt, message.at);
+    sub.seq = message.seq;
+    sub.at = Math.max(sub.at, message.at);
     if (!sub.echo && message.publisher === sub.conn.id) return;
     counters.delivered += 1;
     if (replayed) {
       send(sub.conn, messageFrame(sub.channel.name, message, true));
       return;
     }
-    const cached = sub.channel.frame;
-    const text =
-      cached !== undefined && cached.seq === message.seq
-        ? cached.text
-        : messageFrame(sub.channel.name, message, false);
+    let cached = sub.channel.frame;
     if (cached === undefined || cached.seq !== message.seq)
-      sub.channel.frame = { seq: message.seq, text };
-    send(sub.conn, text);
+      cached = sub.channel.frame = {
+        seq: message.seq,
+        text: messageFrame(sub.channel.name, message, false),
+      };
+    send(sub.conn, cached.text);
   }
 
   /**
-   * Delivers, in order and without a gap, the messages after `sub.lastSeq` up to `upTo` and whatever is buffered. Fetches the
+   * Delivers, in order and without a gap, the messages after `sub.seq` up to `upTo` and whatever is buffered. Fetches the
    * missing ones from history. When history no longer has them: a subscription that reported a gap skips ahead; any other one
    * is removed with `unsubbed why:"gap"`.
    */
@@ -469,29 +462,29 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     sub.pumping = true;
     try {
       while (sub.active) {
-        sub.buffer = sub.buffer.filter((message) => message.seq > sub.lastSeq);
+        sub.buffer = sub.buffer.filter((message) => message.seq > sub.seq);
         const next = sub.buffer[0];
-        if (next !== undefined && next.seq === sub.lastSeq + 1) {
+        if (next !== undefined && next.seq === sub.seq + 1) {
           deliver(sub, next, false);
           sub.buffer.shift();
           continue;
         }
         const target = next === undefined ? (upTo ?? 0) : next.seq - 1;
-        if (sub.lastSeq >= target) break;
+        if (sub.seq >= target) break;
         const page = await adapter.history(
           sub.channel.name,
-          sub.lastSeq,
-          Math.min(REPLAY_PAGE, target - sub.lastSeq),
+          sub.seq,
+          Math.min(REPLAY_PAGE, target - sub.seq),
         );
         if (!sub.active) return;
         const first = page.messages[0];
-        if (first === undefined || first.seq !== sub.lastSeq + 1) {
+        if (first === undefined || first.seq !== sub.seq + 1) {
           if (!sub.gapOk) {
             removeSub(sub, "gap");
             return;
           }
           // The gap was reported at subscribe time: continue from what is retained.
-          sub.lastSeq = (first?.seq ?? target + 1) - 1;
+          sub.seq = (first?.seq ?? target + 1) - 1;
           continue;
         }
         for (const message of page.messages) {
@@ -523,7 +516,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
         sub.state = event.member.s;
       }
       if (!sub.active || (!sub.joined && !sub.watch)) continue;
-      if (sub.presenceQueue !== undefined) sub.presenceQueue.push(event);
+      if (sub.queued !== undefined) sub.queued.push(event);
       else sendPresence(sub, event);
     }
   }
@@ -568,7 +561,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     if (chan.subs.size > 0 || chan.closing) return;
     chan.closing = true;
     if (chans.get(chan.name) === chan) chans.delete(chan.name);
-    const stops = [chan.adapterSub, chan.presenceSub].filter(
+    const stops = [chan.feed, chan.pfeed].filter(
       (item): item is Promise<Unsubscribe> => item !== undefined,
     );
     await Promise.all(
@@ -594,26 +587,26 @@ export function createHubCore(options: HubOptions = {}): HubCore {
   ): Promise<void> {
     const { c: name, n } = frame;
     if (conn.subs.has(name))
-      return fail(conn, n, "conflict", name, __DEV__ ? "already subscribed" : undefined);
+      return fail(conn, n, "conflict", name, ...(__DEV__ ? ["already subscribed"] : []));
     if (conn.subs.size >= limits.maxChannelsPerConnection)
       return fail(
         conn,
         n,
         "limit",
         name,
-        __DEV__ ? "too many channels on this connection" : undefined,
+        ...(__DEV__ ? ["too many channels on this connection"] : []),
       );
     const found = match(name);
     if (found === undefined) return fail(conn, n, identityDenied(conn), name);
     const wantsPresence = frame.hasPresence || frame.watch === true;
-    const pending = { conn, channel: name, revoked: false };
+    const pending = { conn, channel: name };
     judging.add(pending);
     try {
       if (
         !(await allowed(found.rule, "subscribe", name, found.params, conn.identity)) ||
         (wantsPresence &&
           !(await allowed(found.rule, "presence", name, found.params, conn.identity))) ||
-        pending.revoked
+        !judging.has(pending)
       )
         return fail(conn, n, identityDenied(conn), name);
     } finally {
@@ -628,39 +621,35 @@ export function createHubCore(options: HubOptions = {}): HubCore {
         n,
         "too_large",
         name,
-        __DEV__ ? "the presence state is too large" : undefined,
+        ...(__DEV__ ? ["the presence state is too large"] : []),
       );
     if (conn.closed) return;
     const chan = channelState(name);
     if (chan.subs.size >= limits.maxSubscribersPerChannel)
-      return fail(conn, n, "limit", name, __DEV__ ? "the channel is full" : undefined);
+      return fail(conn, n, "limit", name, ...(__DEV__ ? ["the channel is full"] : []));
     const sub: SubState = {
       conn,
       channel: chan,
-      rule: found.rule,
-      params: found.params,
+      ...found,
       echo: frame.echo !== false,
       watch: frame.watch === true,
-      joined: false,
       version: 0,
       state: null,
-      lastSeq: 0,
-      lastAt: now(),
+      seq: 0,
+      at: now(),
       pumping: true,
-      gapOk: false,
       buffer: [],
-      presenceQueue: wantsPresence ? [] : undefined,
-      joining: undefined,
+      queued: wantsPresence ? [] : undefined,
       active: true,
     };
     conn.subs.set(name, sub);
     chan.subs.add(sub);
     try {
-      await ensureFeed(chan, "adapterSub", () =>
+      await ensureFeed(chan, "feed", () =>
         adapter.subscribe(chan.name, (message) => onMessage(chan, message)),
       );
       if (wantsPresence) {
-        await ensureFeed(chan, "presenceSub", () =>
+        await ensureFeed(chan, "pfeed", () =>
           adapter.presenceSubscribe(chan.name, (event) => onPresence(chan, event)),
         );
         startHeartbeat();
@@ -672,12 +661,12 @@ export function createHubCore(options: HubOptions = {}): HubCore {
       let gap = false;
       let reset = false;
       if (after === undefined) {
-        sub.lastSeq = head;
+        sub.seq = head;
       } else if (after > head) {
         reset = true;
-        sub.lastSeq = head;
+        sub.seq = head;
       } else {
-        sub.lastSeq = after;
+        sub.seq = after;
         gap = probe.oldest === 0 ? head > after : probe.oldest > after + 1;
         sub.gapOk = gap;
       }
@@ -709,25 +698,22 @@ export function createHubCore(options: HubOptions = {}): HubCore {
   /** Joins one at a time per channel: the capacity check reads the set, so two joins in flight would both see room. */
   function joinPresence(sub: SubState, state: Json): Promise<void> {
     const name = sub.channel.name;
-    const run = (joinChains.get(name) ?? Promise.resolve()).then(() => joinOne(sub, state));
+    const run = (joinChains.get(name) ?? Promise.resolve()).then(async () => {
+      if (!sub.active) return;
+      if ((await adapter.presenceList(name)).length >= limits.maxPresenceMembers)
+        throw new RealtimeError("limit", ...(__DEV__ ? ["the presence set is full"] : []));
+      sub.version = 1;
+      sub.state = state;
+      sub.joined = true;
+      startHeartbeat();
+      await adapter.presenceSet(name, memberOf(sub), limits.presenceTtlMs);
+    });
     const settle = (): void => {
       if (joinChains.get(name) === tail) joinChains.delete(name);
     };
     const tail: Promise<void> = run.then(settle, settle);
     joinChains.set(name, tail);
     return run;
-  }
-
-  async function joinOne(sub: SubState, state: Json): Promise<void> {
-    if (!sub.active) return;
-    const existing = await adapter.presenceList(sub.channel.name);
-    if (existing.length >= limits.maxPresenceMembers)
-      throw new RealtimeError("limit", __DEV__ ? "the presence set is full" : undefined);
-    sub.version = 1;
-    sub.state = state;
-    sub.joined = true;
-    startHeartbeat();
-    await adapter.presenceSet(sub.channel.name, memberOf(sub), limits.presenceTtlMs);
   }
 
   /** The presence member a joined subscription stands for. */
@@ -745,8 +731,8 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     const members = await adapter.presenceList(sub.channel.name);
     if (!sub.active) return;
     sendFrame(sub.conn, { t: "pres", c: sub.channel.name, op: "sync", m: members });
-    const queued = sub.presenceQueue ?? [];
-    sub.presenceQueue = undefined;
+    const queued = sub.queued ?? [];
+    sub.queued = undefined;
     const known = new Map(members.map((member) => [member.id, member.v]));
     for (const event of queued) {
       // What the snapshot already shows is not announced again.
@@ -773,7 +759,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
         undefined,
         "too_large",
         frame.c,
-        __DEV__ ? "the presence state is too large" : undefined,
+        ...(__DEV__ ? ["the presence state is too large"] : []),
       );
     if (!conn.publishBucket.take(now())) return limit(conn, undefined, frame.c);
     sub.version += 1;
@@ -803,7 +789,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     )
       return fail(conn, n, identityDenied(conn), name);
     if (frame.d.length > limits.maxMessageBytes)
-      return fail(conn, n, "too_large", name, __DEV__ ? "the message is too large" : undefined);
+      return fail(conn, n, "too_large", name, ...(__DEV__ ? ["the message is too large"] : []));
     // A channel with no subscriber on this server has no bucket: only the connection's own rate applies to it.
     if (!conn.publishBucket.take(now()) || chans.get(name)?.bucket.take(now()) === false)
       return limit(conn, n, name);
@@ -868,7 +854,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     const handler = sub.rule.handlers?.[frame.e];
     if (handler === undefined) return fail(conn, n, "no_handler", name);
     if (conn.pending.size >= limits.maxPendingRequests)
-      return fail(conn, n, "limit", name, __DEV__ ? "too many requests in flight" : undefined);
+      return fail(conn, n, "limit", name, ...(__DEV__ ? ["too many requests in flight"] : []));
     if (!conn.publishBucket.take(now())) return limit(conn, n, name);
     const controller = new AbortController();
     conn.pending.add(controller);
@@ -894,7 +880,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
         const reply = (await Promise.race([run, aborted])) ?? null;
         const text = JSON.stringify(reply);
         if (text === undefined || byteLength(text) > limits.maxMessageBytes)
-          return fail(conn, n, "too_large", name, __DEV__ ? "the reply is too large" : undefined);
+          return fail(conn, n, "too_large", name, ...(__DEV__ ? ["the reply is too large"] : []));
         send(conn, `{"t":"rep","n":${n},"d":${text}}`);
       } catch (error) {
         if (error instanceof RealtimeError)
@@ -938,11 +924,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     const n = "n" in frame ? frame.n : undefined;
     // An `unsub` spends a token but is never refused: the client cannot tell a refused one (the answer names no frame), and would
     // believe it left a channel the hub still holds, so its next `sub` of that channel would be a conflict.
-    if (
-      (frame.t === "sub" || frame.t === "unsub") &&
-      !conn.controlBucket.take(now()) &&
-      frame.t === "sub"
-    )
+    if ((frame.t === "sub" || frame.t === "unsub") && !conn.ctl.take(now()) && frame.t === "sub")
       return limit(conn, n, frame.c);
     try {
       switch (frame.t) {
@@ -1040,35 +1022,31 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     if (beating) return;
     beating = true;
     try {
-      await beatOnce();
+      const refs: { channel: string; id: string }[] = [];
+      const watched = new Set<string>();
+      for (const conn of conns.values())
+        for (const sub of conn.subs.values()) {
+          if (sub.joined) refs.push({ channel: sub.channel.name, id: conn.id });
+          if (sub.joined || sub.watch) watched.add(sub.channel.name);
+        }
+      if (refs.length === 0 && watched.size === 0) {
+        clearInterval(heartbeat);
+        heartbeat = undefined;
+        return;
+      }
+      try {
+        const missing = await adapter.presenceTouch(refs, limits.presenceTtlMs);
+        for (const ref of missing) {
+          const sub = conns.get(ref.id)?.subs.get(ref.channel);
+          if (sub === undefined || !sub.joined) continue;
+          await adapter.presenceSet(ref.channel, memberOf(sub), limits.presenceTtlMs);
+        }
+        for (const channel of watched) await adapter.presenceReap(channel);
+      } catch (error) {
+        report(error, { where: "presenceHeartbeat" });
+      }
     } finally {
       beating = false;
-    }
-  }
-
-  async function beatOnce(): Promise<void> {
-    const refs: { channel: string; id: string }[] = [];
-    const watched = new Set<string>();
-    for (const conn of conns.values())
-      for (const sub of conn.subs.values()) {
-        if (sub.joined) refs.push({ channel: sub.channel.name, id: conn.id });
-        if (sub.joined || sub.watch) watched.add(sub.channel.name);
-      }
-    if (refs.length === 0 && watched.size === 0) {
-      clearInterval(heartbeat);
-      heartbeat = undefined;
-      return;
-    }
-    try {
-      const missing = await adapter.presenceTouch(refs, limits.presenceTtlMs);
-      for (const ref of missing) {
-        const sub = conns.get(ref.id)?.subs.get(ref.channel);
-        if (sub === undefined || !sub.joined) continue;
-        await adapter.presenceSet(ref.channel, memberOf(sub), limits.presenceTtlMs);
-      }
-      for (const channel of watched) await adapter.presenceReap(channel);
-    } catch (error) {
-      report(error, { where: "presenceHeartbeat" });
     }
   }
 
@@ -1090,8 +1068,8 @@ export function createHubCore(options: HubOptions = {}): HubCore {
     },
 
     connect(transport, identity = {}, connectOptions = {}) {
-      if (closing) throw new RealtimeError("closed", __DEV__ ? "the hub is closed" : undefined);
-      let release: () => void = () => undefined;
+      if (closing) throw new RealtimeError("closed", ...(__DEV__ ? ["the hub is closed"] : []));
+      let release: (() => void) | undefined;
       const done = new Promise<void>((resolve) => {
         release = resolve;
       });
@@ -1109,7 +1087,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
           connectOptions.publishBucket ??
           new TokenBucket(limits.publishesPerSecond, limits.publishBurst, now()),
         // The refill is the publish rate; the burst always covers a connection declaring all its channels at once.
-        controlBucket: new TokenBucket(
+        ctl: new TokenBucket(
           limits.publishesPerSecond,
           Math.max(limits.publishBurst, limits.maxChannelsPerConnection),
           now(),
@@ -1119,8 +1097,6 @@ export function createHubCore(options: HubOptions = {}): HubCore {
         invalid: new WindowCounter(10, 60_000),
         limited: new WindowCounter(50, 10_000),
         pending: new Set(),
-        running: false,
-        closed: false,
         release,
         done,
       };
@@ -1168,17 +1144,17 @@ export function createHubCore(options: HubOptions = {}): HubCore {
       if (!isChannelName(channel))
         throw new RealtimeError(
           "bad_channel",
-          __DEV__ ? `"${channel}" is not a valid channel name` : undefined,
+          ...(__DEV__ ? [`"${channel}" is not a valid channel name`] : []),
         );
       if (!isEventName(event))
         throw new RealtimeError(
           "bad_frame",
-          __DEV__ ? `"${event}" is not a valid event name` : undefined,
+          ...(__DEV__ ? [`"${event}" is not a valid event name`] : []),
         );
       if (publishOptions.key !== undefined && !isIdempotencyKey(publishOptions.key))
         throw new RealtimeError(
           "bad_frame",
-          __DEV__ ? "the idempotency key is not valid" : undefined,
+          ...(__DEV__ ? ["the idempotency key is not valid"] : []),
         );
       let text: string | undefined;
       try {
@@ -1191,7 +1167,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
       if (text === undefined)
         throw new TypeError(__DEV__ ? "the data is not JSON" : "REALTIME_DATA");
       if (byteLength(text) > limits.maxMessageBytes)
-        throw new RealtimeError("too_large", __DEV__ ? "the message is too large" : undefined);
+        throw new RealtimeError("too_large", ...(__DEV__ ? ["the message is too large"] : []));
       const found = match(channel);
       const result = await adapter.publish(
         channel,
@@ -1211,7 +1187,7 @@ export function createHubCore(options: HubOptions = {}): HubCore {
       if (identity.user === undefined)
         throw new RealtimeError(
           "unauthorized",
-          __DEV__ ? "presence changes over HTTP need a signed-in user" : undefined,
+          ...(__DEV__ ? ["presence changes over HTTP need a signed-in user"] : []),
         );
       const found = match(channel);
       if (
@@ -1222,12 +1198,12 @@ export function createHubCore(options: HubOptions = {}): HubCore {
       if (byteLength(JSON.stringify(state)) > limits.maxStateBytes)
         throw new RealtimeError(
           "too_large",
-          __DEV__ ? "the presence state is too large" : undefined,
+          ...(__DEV__ ? ["the presence state is too large"] : []),
         );
       const members = await adapter.presenceList(channel);
       const member = members.find((item) => item.id === connectionId);
       if (member === undefined || member.u !== identity.user)
-        throw new RealtimeError("forbidden", __DEV__ ? "that connection is not yours" : undefined);
+        throw new RealtimeError("forbidden", ...(__DEV__ ? ["that connection is not yours"] : []));
       // The connection may live on this server: its own copy of the member is what the heartbeat writes back after an expiry, so
       // it moves with the stored one (the same for a connection on another server, through the presence event below).
       const local = conns.get(connectionId)?.subs.get(channel);
@@ -1258,9 +1234,10 @@ export function createHubCore(options: HubOptions = {}): HubCore {
         (target.channel === undefined || channel === target.channel);
       let count = 0;
       for (const item of judging) {
-        if (item.revoked || !hit(item.conn, item.channel)) continue;
-        item.revoked = true;
-        count += 1;
+        if (hit(item.conn, item.channel)) {
+          judging.delete(item);
+          count += 1;
+        }
       }
       for (const conn of [...conns.values()]) {
         for (const sub of [...conn.subs.values()]) {

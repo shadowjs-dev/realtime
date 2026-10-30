@@ -25,7 +25,7 @@ import type {
   RealtimeOptions,
   Status,
 } from "./types";
-import { backoff, clientId, resolveUrl, sendUrl } from "./util";
+import { backoff, resolveUrl } from "./util";
 import { openSocket } from "./ws";
 
 /** Close codes that mean the client did something the server will not accept again. */
@@ -130,7 +130,10 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
   const queueTtl = options.queueTtlMs ?? 30_000;
   const ackTtl = options.ackTimeoutMs ?? 10_000;
   const auto = (options.transport ?? "auto") === "auto";
-  const id = clientId();
+  // A random identifier of 12 base-36 characters (six bytes of two characters each), used to build idempotency keys.
+  const id = Array.from(globalThis.crypto.getRandomValues(new Uint8Array(6)), (byte) =>
+    byte.toString(36).padStart(2, "0"),
+  ).join("");
   const chans = new Map<string, Chan>();
   const dirty = new Set<Chan>();
   const queue: Op[] = [];
@@ -697,8 +700,6 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
         }
         return;
       }
-      case "pong":
-        return;
     }
   };
 
@@ -754,10 +755,9 @@ export function createRealtime<Schema extends ChannelSchema = ChannelSchema>(
     try {
       const headers = new Headers(await getHeaders());
       headers.set("content-type", "application/json");
-      const url =
-        options.postUrl === undefined
-          ? sendUrl(resolveUrl(options.url, false))
-          : resolveUrl(options.postUrl, false);
+      const url = resolveUrl(options.postUrl ?? options.url, false);
+      // The default POST URL is the stream path plus `/send`, keeping the query.
+      if (options.postUrl === undefined) url.pathname = `${url.pathname.replace(/\/$/, "")}/send`;
       const response = await doFetch(url, { method: "POST", headers, body, signal: mine.signal });
       if (response.ok) {
         const parsed = (await response.json()) as { frames?: unknown };
