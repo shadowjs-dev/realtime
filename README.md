@@ -106,7 +106,7 @@ Root, `@shadow-js/realtime`: the wire protocol and shared types.
 
 ## Production error codes
 
-A production build keeps a short code instead of the development explanation, so message text never reaches user bundles. Search this table for the code. In the explanation, `…` stands for a value the development message names. A code followed by a word names the option, feature or member at fault.
+For the errors in the table below, a production build keeps a short code instead of the development explanation; other errors keep their message in every build. Search this table for the code. In the explanation, `…` stands for a value the development message names. A code followed by a word names the option, feature or member at fault.
 
 | Code | Development explanation |
 | --- | --- |
