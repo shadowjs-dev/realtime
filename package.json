@@ -80,7 +80,7 @@
     "@shadow-js/core": "^1.0.5"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.15",
+    "@biomejs/biome": "2.6.6",
     "@resvg/resvg-wasm": "2.6.2",
     "@shadow-js/core": "^1.0.5",
     "@shadow-js/dusk": "^1.0.5",
@@ -89,16 +89,16 @@
     "@shadow-js/testing": "^1.0.5",
     "@testing-library/dom": "10.4.2",
     "@types/node": "^24.0.0",
-    "esbuild": "0.27.0",
+    "esbuild": "0.28.2",
     "fast-check": "^4.10.2",
     "happy-dom": "21.0.4",
-    "satori": "0.43.0",
+    "satori": "0.63.2",
     "sharp": "0.35.5",
     "subset-font": "2.9.0",
-    "tsdown": "0.23.0",
+    "tsdown": "0.23.7",
     "typescript": "7.0.2",
-    "vite": "8.3.3",
-    "vitest": "5.0.3"
+    "vite": "8.3.7",
+    "vitest": "5.1.0"
   },
   "peerDependenciesMeta": {
     "@shadow-js/core": {
