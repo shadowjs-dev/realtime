@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.2
+
+### Changed
+
+- Released at 1.1.2 with the other packages. No change to this package.
+
 ## 1.1.1
 
 ### Changed
